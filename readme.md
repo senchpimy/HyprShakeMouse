@@ -12,4 +12,4 @@ Además, añade una función de cambio de tamaño del cursor inspirada en macOS 
 - El dock aparecerá automáticamente cuando no haya ventanas activas en Hyprland.
 - Para activar la función de cambio de tamaño del cursor, mueve rápidamente el mouse.
 
-![video][video.gif]
+![video](video.gif)
