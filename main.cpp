@@ -1,10 +1,14 @@
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -16,134 +20,55 @@ struct Posicion {
 const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
 const char *xdg = getenv("XDG_RUNTIME_DIR");
 
-float arc_tan(float y, float x);
-void aumentar_tamano();
-void disminuir_tamano();
-float calcular_velocidad(const Posicion &a, const Posicion &b, float tiempo);
+const int DOCK_HEIGHT = 100;
 
-int main() {
-
-  // const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
-    if (!his || !xdg) {
-        std::cerr << "Error: Variables de entorno no definidas." << std::endl;
-        return 1;
-    }
-  // vector de posiciones con limite de 10
-  std::vector<Posicion> posiciones;
-  posiciones.reserve(10);
-  int veces = 0,cambios_seguidos = 0, time_to_wait = 0;
-
-  std::string socketPath = std::string(xdg) + "/hypr/" + his + "/.socket.sock";
-  std::string comando = "cursorpos";
-
-  while (true) { // Loop infinito
-    int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-      perror("Error al crear el socket");
-      return 1;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
-
-    if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-      perror("Error al conectar con el socket");
-      close(sockfd);
-      return 1;
-    }
-
-    ssize_t bytesEnviados = write(sockfd, comando.c_str(), comando.size());
-    if (bytesEnviados < 0) {
-      perror("Error al enviar el comando");
-      close(sockfd);
-      return 1;
-    }
-
-    shutdown(sockfd, SHUT_WR);
-
-    char buffer[256];
-    ssize_t bytesLeidos = read(sockfd, buffer, sizeof(buffer) - 1);
-    if (bytesLeidos < 0) {
-      perror("Error al leer la respuesta");
-      close(sockfd);
-      return 1;
-    }
-
-    close(sockfd);
-
-    buffer[bytesLeidos] = '\0';
-    // std::cout << "Posición del cursor: " << buffer << std::endl;
-    //  Parsear la respuesta, se delimita por una coma
-    int x, y;
-    if (sscanf(buffer, "%d,%d", &x, &y) != 2) {
-        std::cerr << "Error al parsear la posición del cursor." << std::endl;
-        continue;
-    }
-    Posicion pos = {x, y};
-    posiciones.push_back(pos);
-    int tiempo = 10; // tiempo de espera en ms
-    // velocidad de el movimiento del cursor entre los dos penultimos puntos
-    // (posciciones 8 y 9)
-    float velocidad_pen =calcular_velocidad(posiciones[8], posiciones[7], tiempo);
-    float velocidad_ult = calcular_velocidad(posiciones[9], posiciones[8], tiempo);
-
-    if (std::abs(velocidad_pen - velocidad_ult) > 5) {
-      //std::cout << "Velocidad de movimiento del cursor: " << velocidad_ult
-      //          << " px/s" << std::endl;
-      veces++;
-    } else {
-      veces = 0;
-    }
-
-    if (posiciones.size() > 10) {
-      posiciones.erase(posiciones.begin());
-    }
-
-    if (veces == 3) {
-      veces = 0;
-      cambios_seguidos++;
-    }
-
-    if (cambios_seguidos == 3) {
-      // medir distanciae entre el primer y utlimo punto
-      float distancia = sqrt(pow(posiciones[0].x - posiciones[9].x, 2) +
-                             pow(posiciones[0].y - posiciones[9].y, 2));
-      std::cout << "Distancia recorrida: " << distancia << " px" << std::endl;
-      if (distancia < 250) {
-        std::cout << "Cambio de tamaño" << std::endl;
-        cambios_seguidos = 0;
-        time_to_wait = 30;
-        aumentar_tamano();
-      }
-    }
-
-    if (time_to_wait > 0) {
-      time_to_wait--;
-    }
-
-    if (time_to_wait == 1) {
-      std::cout << "Volver a tamaño original" << std::endl;
-      time_to_wait--;
-      disminuir_tamano();
-    }
-
-    usleep(50000); // Esperar 50ms
-    // imprimir todas las variables para hacer debug
-    // std::cout << "Velocidad de movimiento del cursor: " << velocidad_ult
-    //          << " px/s" << std::endl;
-    // std::cout << "Angulo de movimiento del cursor: " << angulo_ult << "°"
-    //          << std::endl;
-    // std::cout << "Esperando: " << time_to_wait << std::endl;
-    // std::cout << "Veces: " << veces << std::endl;
-    // std::cout << "Cambios seguidos: " << cambios_seguidos << std::endl;
-    // std::cout << "--------------------------------" << std::endl;
-  }
-
-  return 0;
+float calcular_velocidad(const Posicion &a, const Posicion &b, float tiempo) {
+  return std::sqrt(std::pow(b.x - a.x, 2) + std::pow(b.y - a.y, 2)) / tiempo;
 }
 
+bool obtener_posicion_cursor(Posicion &pos) {
+  if (!his || !xdg) {
+    std::cerr << "Error: Variables de entorno no definidas." << std::endl;
+    return false;
+  }
+  std::string socketPath = std::string(xdg) + "/hypr/" + his + "/.socket.sock";
+  std::string comando = "cursorpos";
+  int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (sockfd < 0) {
+    perror("Error al crear el socket");
+    return false;
+  }
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
+  if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    perror("Error al conectar con el socket");
+    close(sockfd);
+    return false;
+  }
+  ssize_t bytesEnviados = write(sockfd, comando.c_str(), comando.size());
+  if (bytesEnviados < 0) {
+    perror("Error al enviar el comando");
+    close(sockfd);
+    return false;
+  }
+  shutdown(sockfd, SHUT_WR);
+  char buffer[256];
+  ssize_t bytesLeidos = read(sockfd, buffer, sizeof(buffer) - 1);
+  if (bytesLeidos < 0) {
+    perror("Error al leer la respuesta");
+    close(sockfd);
+    return false;
+  }
+  buffer[bytesLeidos] = '\0';
+  close(sockfd);
+  if (sscanf(buffer, "%d,%d", &pos.x, &pos.y) != 2) {
+    std::cerr << "Error al parsear la posición del cursor." << std::endl;
+    return false;
+  }
+  return true;
+}
 
 void aumentar_tamano() {
   std::string comando = "setcursor default 50";
@@ -153,27 +78,22 @@ void aumentar_tamano() {
     perror("Error al crear el socket");
     exit(1);
   }
-
   struct sockaddr_un addr;
-  memset(&addr, 0, sizeof(addr));
+  std::memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
-
+  std::strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
   if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
     perror("Error al conectar con el socket");
     close(sockfd);
     exit(1);
   }
-
   ssize_t bytesEnviados = write(sockfd, comando.c_str(), comando.size());
   if (bytesEnviados < 0) {
     perror("Error al enviar el comando");
     close(sockfd);
     exit(1);
   }
-
   shutdown(sockfd, SHUT_WR);
-
   close(sockfd);
 }
 
@@ -185,30 +105,278 @@ void disminuir_tamano() {
     perror("Error al crear el socket");
     exit(1);
   }
-
   struct sockaddr_un addr;
-  memset(&addr, 0, sizeof(addr));
+  std::memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
-
+  std::strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
   if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
     perror("Error al conectar con el socket");
     close(sockfd);
     exit(1);
   }
-
   ssize_t bytesEnviados = write(sockfd, comando.c_str(), comando.size());
   if (bytesEnviados < 0) {
     perror("Error al enviar el comando");
     close(sockfd);
     exit(1);
   }
-
   shutdown(sockfd, SHUT_WR);
-
   close(sockfd);
 }
 
-float calcular_velocidad(const Posicion &a, const Posicion &b, float tiempo) {
-    return sqrt(pow(b.x - a.x, 2) + pow(b.y - a.y, 2)) / tiempo;
+void ejecutar_comando(const std::string &cmd) { system(cmd.c_str()); }
+
+void mostrar_dock() { ejecutar_comando("pkill -36 -f nwg-dock-hyprland"); }
+
+void ocultar_dock() { ejecutar_comando("pkill -37 -f nwg-dock-hyprland"); }
+
+void lanzar_dock_inicial() {
+  std::string flags =
+      " -r -i 64 -w 10 -mb 6 -hd 0 -c 'qs -p "
+      "/home/plof/.config/quickshell/app_launcher/main.qml' -ico "
+      "'/usr/share/icons/kora/actions/symbolic/view-app-grid-symbolic.svg'";
+  std::string cmd = "nwg-dock-hyprland" + flags;
+  ejecutar_comando(cmd);
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+}
+
+std::string ejecutar_y_obtener_salida(const std::string &cmd) {
+  std::string salida;
+  FILE *pipe = popen(cmd.c_str(), "r");
+  if (!pipe)
+    return "";
+  char buffer[256];
+  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    salida += buffer;
+  }
+  pclose(pipe);
+  return salida;
+}
+
+bool evaluarDock(int monitor_height, int dock_height) {
+  try {
+    // Obtener información de monitores
+    std::string monitors_json =
+        ejecutar_y_obtener_salida("hyprctl monitors -j");
+    auto monitors = nlohmann::json::parse(monitors_json);
+
+    if (!monitors.is_array() || monitors.empty()) {
+      std::cerr << "Formato de monitores inválido" << std::endl;
+      return false;
+    }
+
+    // Buscar el monitor enfocado
+    auto focused_monitor =
+        std::find_if(monitors.begin(), monitors.end(),
+                     [](const auto &m) { return m.value("focused", false); });
+
+    if (focused_monitor == monitors.end()) {
+      std::cerr << "No se encontró monitor enfocado" << std::endl;
+      return false;
+    }
+
+    int active_ws = focused_monitor->value("activeWorkspace",
+                                           nlohmann::json({{"id", 0}}))["id"];
+    int special_ws = focused_monitor->value("specialWorkspace",
+                                            nlohmann::json({{"id", 0}}))["id"];
+    int ws_id = (special_ws == 0) ? active_ws : special_ws;
+
+    // Obtener workspaces
+    std::string workspaces_json =
+        ejecutar_y_obtener_salida("hyprctl workspaces -j");
+    auto workspaces = nlohmann::json::parse(workspaces_json);
+
+    if (!workspaces.is_array()) {
+      std::cerr << "Formato de workspaces inválido" << std::endl;
+      return false;
+    }
+
+    // Buscar el workspace actual
+    auto workspace = std::find_if(
+        workspaces.begin(), workspaces.end(),
+        [ws_id](const auto &ws) { return ws.value("id", -1) == ws_id; });
+
+    int window_count = 0;
+    if (workspace != workspaces.end()) {
+      window_count = workspace->value("windows", 0);
+    }
+
+    if (window_count == 0)
+      return true;
+
+    // Obtener clientes
+    std::string clients_json = ejecutar_y_obtener_salida("hyprctl clients -j");
+    auto clients = nlohmann::json::parse(clients_json);
+
+    if (!clients.is_array()) {
+      std::cerr << "Formato de clientes inválido" << std::endl;
+      return false;
+    }
+
+    bool shouldShow = true;
+    for (const auto &client : clients) {
+      if (client.value("workspace", nlohmann::json({{"id", -1}}))["id"] !=
+          ws_id) {
+        continue;
+      }
+
+      auto at = client.value("at", nlohmann::json::array({0, 0}));
+      auto size = client.value("size", nlohmann::json::array({0, 0}));
+
+      if (at.size() < 2 || size.size() < 2)
+        continue;
+
+      int posY = at[1].is_number() ? at[1].get<int>() : 0;
+      int sizeY = size[1].is_number() ? size[1].get<int>() : 0;
+
+      int free_space = monitor_height - posY - sizeY;
+      if (free_space < dock_height) {
+        shouldShow = false;
+        break;
+      }
+    }
+
+    return shouldShow;
+
+  } catch (const nlohmann::json::exception &e) {
+    std::cerr << "Error de JSON: " << e.what() << std::endl;
+    return false;
+  } catch (const std::exception &e) {
+    std::cerr << "Error: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+bool obtener_info_monitor(int &width, int &height) {
+  FILE *pipe = popen("hyprctl monitors -j", "r");
+  if (!pipe) {
+    std::cerr << "Error al ejecutar hyprctl monitors" << std::endl;
+    return false;
+  }
+
+  std::string result;
+  char buffer[256];
+  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    result += buffer;
+  }
+  pclose(pipe);
+
+  try {
+    auto monitors = nlohmann::json::parse(result);
+
+    if (!monitors.is_array() || monitors.empty()) {
+      std::cerr << "Formato de monitores inválido" << std::endl;
+      return false;
+    }
+
+    auto &primer_monitor = monitors[0];
+
+    if (!primer_monitor.contains("width") ||
+        !primer_monitor["width"].is_number()) {
+      std::cerr << "No se pudo obtener el width del monitor" << std::endl;
+      return false;
+    }
+
+    if (!primer_monitor.contains("height") ||
+        !primer_monitor["height"].is_number()) {
+      std::cerr << "No se pudo obtener el height del monitor" << std::endl;
+      return false;
+    }
+
+    width = primer_monitor["width"];
+    height = primer_monitor["height"];
+
+  } catch (const nlohmann::json::exception &e) {
+    std::cerr << "Error al parsear JSON: " << e.what() << std::endl;
+    return false;
+  }
+
+  return true;
+}
+
+int main() {
+  if (!his || !xdg) {
+    std::cerr << "Error: Variables de entorno no definidas." << std::endl;
+    return 1;
+  }
+
+  int mon_width = 0, mon_height = 0;
+  if (!obtener_info_monitor(mon_width, mon_height)) {
+    return 1;
+  }
+  int min_w = mon_width / 2 - 400;
+  int max_w = mon_width / 2 + 400;
+  int min_y = mon_height * 90 / 100; // zona inferior del monitor
+
+  lanzar_dock_inicial();
+  bool dockVisible = true; // estado actual del dock
+
+  std::vector<Posicion> posiciones;
+  posiciones.reserve(10);
+  int veces = 0, cambios_seguidos = 0;
+  int time_to_wait = 0; // contador para revertir el tamaño del cursor
+  const int tiempo_espera_ms = 10; // usado para calcular la velocidad (en ms)
+
+  while (true) {
+    Posicion pos;
+    if (!obtener_posicion_cursor(pos)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      continue;
+    }
+    posiciones.push_back(pos);
+    if (posiciones.size() > 10) {
+      posiciones.erase(posiciones.begin());
+    }
+    if (posiciones.size() >= 10) {
+      float velocidad_pen =
+          calcular_velocidad(posiciones[8], posiciones[7], tiempo_espera_ms);
+      float velocidad_ult =
+          calcular_velocidad(posiciones[9], posiciones[8], tiempo_espera_ms);
+      if (std::abs(velocidad_pen - velocidad_ult) > 5) {
+        veces++;
+      } else {
+        veces = 0;
+      }
+      if (veces == 3) {
+        veces = 0;
+        cambios_seguidos++;
+      }
+      if (cambios_seguidos == 3) {
+        cambios_seguidos = 0;
+        float distancia =
+            std::sqrt(std::pow(posiciones[0].x - posiciones[9].x, 2) +
+                      std::pow(posiciones[0].y - posiciones[9].y, 2));
+        std::cout << "Distancia recorrida: " << distancia << " px" << std::endl;
+        if (distancia < 300) {
+          std::cout << "Cambio de tamaño del cursor" << std::endl;
+          time_to_wait = 30; // Tiempo de espera para revertir
+          aumentar_tamano();
+        }
+      }
+    }
+    if (time_to_wait > 0) {
+      time_to_wait--;
+      if (time_to_wait == 1) {
+        std::cout << "Restaurando tamaño original del cursor" << std::endl;
+        disminuir_tamano();
+      }
+    }
+
+    bool cursorZona = (pos.y > min_y && pos.x >= min_w && pos.x <= max_w);
+    bool dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
+    bool shouldShowDock = cursorZona || dockWorkspace;
+    if (shouldShowDock && !dockVisible) {
+      std::cout << "Mostrando dock" << std::endl;
+      mostrar_dock();
+      dockVisible = true;
+    } else if (!shouldShowDock && dockVisible) {
+      std::cout << "Ocultando dock" << std::endl;
+      ocultar_dock();
+      dockVisible = false;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  return 0;
 }
