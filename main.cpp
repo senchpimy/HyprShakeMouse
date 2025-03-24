@@ -19,27 +19,19 @@ const char *xdg = getenv("XDG_RUNTIME_DIR");
 float arc_tan(float y, float x);
 void aumentar_tamano();
 void disminuir_tamano();
+float calcular_velocidad(const Posicion &a, const Posicion &b, float tiempo);
 
 int main() {
 
-  int time_to_wait = 0; // 3 * 50 * 1000; // 3 segundos
   // const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
-  if (!his) {
-    std::cerr << "Error: HYPRLAND_INSTANCE_SIGNATURE no está definida."
-              << std::endl;
-    return 1;
-  }
-
-  const char *xdg = getenv("XDG_RUNTIME_DIR");
-  if (!xdg) {
-    std::cerr << "Error: XDG_RUNTIME_DIR no está definida." << std::endl;
-    return 1;
-  }
+    if (!his || !xdg) {
+        std::cerr << "Error: Variables de entorno no definidas." << std::endl;
+        return 1;
+    }
   // vector de posiciones con limite de 10
   std::vector<Posicion> posiciones;
   posiciones.reserve(10);
-  int veces = 0;
-  int cambios_seguidos = 0;
+  int veces = 0,cambios_seguidos = 0, time_to_wait = 0;
 
   std::string socketPath = std::string(xdg) + "/hypr/" + his + "/.socket.sock";
   std::string comando = "cursorpos";
@@ -84,35 +76,22 @@ int main() {
     buffer[bytesLeidos] = '\0';
     // std::cout << "Posición del cursor: " << buffer << std::endl;
     //  Parsear la respuesta, se delimita por una coma
-    int x = atoi(strtok(buffer, ","));
-    int y = atoi(strtok(nullptr, ","));
+    int x, y;
+    if (sscanf(buffer, "%d,%d", &x, &y) != 2) {
+        std::cerr << "Error al parsear la posición del cursor." << std::endl;
+        continue;
+    }
     Posicion pos = {x, y};
     posiciones.push_back(pos);
     int tiempo = 10; // tiempo de espera en ms
     // velocidad de el movimiento del cursor entre los dos penultimos puntos
     // (posciciones 8 y 9)
-    float velocidad_pen = sqrt(pow(posiciones[8].x - posiciones[7].x, 2) +
-                               pow(posiciones[8].y - posiciones[7].y, 2)) /
-                          tiempo;
-    // velocidad de el movimiento del cursor entre los dos ultimos puntos
-    // (posciciones 9 y 10)
-    float velocidad_ult = sqrt(pow(posiciones[9].x - posiciones[8].x, 2) +
-                               pow(posiciones[9].y - posiciones[8].y, 2)) /
-                          tiempo;
+    float velocidad_pen =calcular_velocidad(posiciones[8], posiciones[7], tiempo);
+    float velocidad_ult = calcular_velocidad(posiciones[9], posiciones[8], tiempo);
 
-    // angulo de el movimiento del cursor entre los dos penultimos puntos
-    //  (posciciones 8 y 9)
-    // float angulo_pen = arc_tan(posiciones[8].y - posiciones[7].y,
-    //                           posiciones[8].x - posiciones[7].x);
-    //// angulo de el movimiento del cursor entre los dos ultimos puntos
-    ////  (posciciones 9 y 10)
-    // float angulo_ult = arc_tan(posiciones[9].y - posiciones[8].y,
-    //                            posiciones[9].x - posiciones[8].x);
-    //// si la difrencia de las velocidades es mayor a 10
-    //// se imprime la velocidad de el movimiento del cursor
     if (std::abs(velocidad_pen - velocidad_ult) > 5) {
-      std::cout << "Velocidad de movimiento del cursor: " << velocidad_ult
-                << " px/s" << std::endl;
+      //std::cout << "Velocidad de movimiento del cursor: " << velocidad_ult
+      //          << " px/s" << std::endl;
       veces++;
     } else {
       veces = 0;
@@ -165,7 +144,6 @@ int main() {
   return 0;
 }
 
-float arc_tan(float y, float x) { return atan2(y, x) * 180 / M_PI; }
 
 void aumentar_tamano() {
   std::string comando = "setcursor default 50";
@@ -229,4 +207,8 @@ void disminuir_tamano() {
   shutdown(sockfd, SHUT_WR);
 
   close(sockfd);
+}
+
+float calcular_velocidad(const Posicion &a, const Posicion &b, float tiempo) {
+    return sqrt(pow(b.x - a.x, 2) + pow(b.y - a.y, 2)) / tiempo;
 }
