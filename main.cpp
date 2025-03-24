@@ -1,4 +1,3 @@
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -8,7 +7,6 @@
 #include <string>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -99,7 +97,9 @@ void cambiar_tamano_cursor(int tamaño) {
   }
 }
 
-void aumentar_tamano() { cambiar_tamano_cursor(50); }
+void aumentar_tamano() {
+  cambiar_tamano_cursor(50);
+} // 70 es mejor pero Hyprland se laggea
 void disminuir_tamano() { cambiar_tamano_cursor(25); }
 
 void ejecutar_comando(const std::string &cmd) { system(cmd.c_str()); }
@@ -115,7 +115,7 @@ void lanzar_dock_inicial() {
       "'/usr/share/icons/kora/actions/symbolic/view-app-grid-symbolic.svg'";
   std::string cmd = "nwg-dock-hyprland" + flags;
   ejecutar_comando(cmd);
-  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  // std::this_thread::sleep_for(std::chrono::milliseconds(600));
 }
 
 std::string ejecutar_y_obtener_salida(const std::string &cmd) {
@@ -292,13 +292,15 @@ int main() {
   std::vector<Posicion> posiciones;
   posiciones.reserve(10);
   int veces = 0, cambios_seguidos = 0;
-  int time_to_wait = 0; // contador para revertir el tamaño del cursor
-  const int tiempo_espera_ms = 9; // usado para calcular la velocidad (en ms)
+  int time_to_wait = 0;        // contador para revertir el tamaño del cursor
+  const int sensibilidad = 10; // Entre más alto, menos sensible
+  const int sensibilidad_distancia = 250; // Entre más alto, menos sensible
+  const int tiempo = 80;
 
   while (true) {
     Posicion pos;
     if (!obtener_posicion_cursor(pos)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      // std::this_thread::sleep_for(std::chrono::milliseconds(50));
       continue;
     }
     posiciones.push_back(pos);
@@ -307,27 +309,29 @@ int main() {
     }
     if (posiciones.size() >= 10) {
       float velocidad_pen =
-          calcular_velocidad(posiciones[8], posiciones[7], tiempo_espera_ms);
+          calcular_velocidad(posiciones[8], posiciones[7], sensibilidad);
       float velocidad_ult =
-          calcular_velocidad(posiciones[9], posiciones[8], tiempo_espera_ms);
-      if (std::abs(velocidad_pen - velocidad_ult) > 5) {
-        veces++;
+          calcular_velocidad(posiciones[9], posiciones[8], sensibilidad);
+      if (std::abs(velocidad_pen - velocidad_ult) > 4) {
+        std::cout << "Una vez" << std::endl;
+        veces += 100;
       } else {
-        veces = 0;
+        veces--; // Disminuir el contador pero no 0
       }
-      if (veces == 3) {
+      if (veces >= 200) {
         veces = 0;
         cambios_seguidos++;
+        std::cout << "Una cambio seguido" << std::endl;
       }
-      if (cambios_seguidos == 3) {
+      if (cambios_seguidos >= 2) {
         cambios_seguidos = 0;
         float distancia =
             std::sqrt(std::pow(posiciones[0].x - posiciones[9].x, 2) +
                       std::pow(posiciones[0].y - posiciones[9].y, 2));
         std::cout << "Distancia recorrida: " << distancia << " px" << std::endl;
-        if (distancia < 300) {
-          std::cout << "Cambio de tamaño del cursor" << std::endl;
-          time_to_wait = 30; // Tiempo de espera para revertir
+        if (distancia < sensibilidad_distancia) {
+          // std::cout << "Cambio de tamaño del cursor" << std::endl;
+          time_to_wait = tiempo; // Tiempo de espera para revertir
           aumentar_tamano();
         }
       }
@@ -335,7 +339,7 @@ int main() {
     if (time_to_wait > 0) {
       time_to_wait--;
       if (time_to_wait == 1) {
-        std::cout << "Restaurando tamaño original del cursor" << std::endl;
+        // std::cout << "Restaurando tamaño original del cursor" << std::endl;
         disminuir_tamano();
       }
     }
@@ -344,16 +348,16 @@ int main() {
     bool dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
     bool shouldShowDock = cursorZona || dockWorkspace;
     if (shouldShowDock && !dockVisible) {
-      std::cout << "Mostrando dock" << std::endl;
+      // std::cout << "Mostrando dock" << std::endl;
       mostrar_dock();
       dockVisible = true;
     } else if (!shouldShowDock && dockVisible) {
-      std::cout << "Ocultando dock" << std::endl;
+      // std::cout << "Ocultando dock" << std::endl;
       ocultar_dock();
       dockVisible = false;
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    usleep(5000);
   }
 
   return 0;
