@@ -22,107 +22,85 @@ const char *xdg = getenv("XDG_RUNTIME_DIR");
 
 const int DOCK_HEIGHT = 100;
 
-float calcular_velocidad(const Posicion &a, const Posicion &b, float tiempo) {
-  return std::sqrt(std::pow(b.x - a.x, 2) + std::pow(b.y - a.y, 2)) / tiempo;
-}
-
-bool obtener_posicion_cursor(Posicion &pos) {
+bool enviar_comando_socket(const std::string &comando, std::string &respuesta) {
   if (!his || !xdg) {
     std::cerr << "Error: Variables de entorno no definidas." << std::endl;
     return false;
   }
+
   std::string socketPath = std::string(xdg) + "/hypr/" + his + "/.socket.sock";
-  std::string comando = "cursorpos";
   int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (sockfd < 0) {
     perror("Error al crear el socket");
     return false;
   }
+
   struct sockaddr_un addr;
   std::memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   std::strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
+
   if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
     perror("Error al conectar con el socket");
     close(sockfd);
     return false;
   }
+
   ssize_t bytesEnviados = write(sockfd, comando.c_str(), comando.size());
   if (bytesEnviados < 0) {
     perror("Error al enviar el comando");
     close(sockfd);
     return false;
   }
-  shutdown(sockfd, SHUT_WR);
+
+  shutdown(sockfd, SHUT_WR); // No más datos para enviar
+
+  // Leer toda la respuesta
   char buffer[256];
-  ssize_t bytesLeidos = read(sockfd, buffer, sizeof(buffer) - 1);
+  respuesta.clear();
+  ssize_t bytesLeidos;
+  while ((bytesLeidos = read(sockfd, buffer, sizeof(buffer) - 1)) > 0) {
+    buffer[bytesLeidos] = '\0';
+    respuesta += buffer;
+  }
+
   if (bytesLeidos < 0) {
     perror("Error al leer la respuesta");
     close(sockfd);
     return false;
   }
-  buffer[bytesLeidos] = '\0';
+
   close(sockfd);
-  if (sscanf(buffer, "%d,%d", &pos.x, &pos.y) != 2) {
+  return true;
+}
+
+float calcular_velocidad(const Posicion &a, const Posicion &b, float tiempo) {
+  return std::sqrt(std::pow(b.x - a.x, 2) + std::pow(b.y - a.y, 2)) / tiempo;
+}
+
+bool obtener_posicion_cursor(Posicion &pos) {
+  std::string respuesta;
+  if (!enviar_comando_socket("cursorpos", respuesta)) {
+    return false;
+  }
+  if (sscanf(respuesta.c_str(), "%d,%d", &pos.x, &pos.y) != 2) {
     std::cerr << "Error al parsear la posición del cursor." << std::endl;
     return false;
   }
   return true;
 }
 
-void aumentar_tamano() {
-  std::string comando = "setcursor default 50";
-  std::string socketPath = std::string(xdg) + "/hypr/" + his + "/.socket.sock";
-  int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (sockfd < 0) {
-    perror("Error al crear el socket");
+void cambiar_tamano_cursor(int tamaño) {
+  std::string comando = "setcursor default " + std::to_string(tamaño);
+  std::string respuesta;
+  if (!enviar_comando_socket(comando, respuesta)) {
+    std::cerr << "Error al modificar el tamaño del cursor." << std::endl;
     exit(1);
   }
-  struct sockaddr_un addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sun_family = AF_UNIX;
-  std::strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
-  if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("Error al conectar con el socket");
-    close(sockfd);
-    exit(1);
-  }
-  ssize_t bytesEnviados = write(sockfd, comando.c_str(), comando.size());
-  if (bytesEnviados < 0) {
-    perror("Error al enviar el comando");
-    close(sockfd);
-    exit(1);
-  }
-  shutdown(sockfd, SHUT_WR);
-  close(sockfd);
 }
 
-void disminuir_tamano() {
-  std::string comando = "setcursor default 25";
-  std::string socketPath = std::string(xdg) + "/hypr/" + his + "/.socket.sock";
-  int sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (sockfd < 0) {
-    perror("Error al crear el socket");
-    exit(1);
-  }
-  struct sockaddr_un addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sun_family = AF_UNIX;
-  std::strncpy(addr.sun_path, socketPath.c_str(), sizeof(addr.sun_path) - 1);
-  if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    perror("Error al conectar con el socket");
-    close(sockfd);
-    exit(1);
-  }
-  ssize_t bytesEnviados = write(sockfd, comando.c_str(), comando.size());
-  if (bytesEnviados < 0) {
-    perror("Error al enviar el comando");
-    close(sockfd);
-    exit(1);
-  }
-  shutdown(sockfd, SHUT_WR);
-  close(sockfd);
-}
+void aumentar_tamano() { cambiar_tamano_cursor(50); }
+void disminuir_tamano() { cambiar_tamano_cursor(25); }
 
 void ejecutar_comando(const std::string &cmd) { system(cmd.c_str()); }
 
@@ -315,7 +293,7 @@ int main() {
   posiciones.reserve(10);
   int veces = 0, cambios_seguidos = 0;
   int time_to_wait = 0; // contador para revertir el tamaño del cursor
-  const int tiempo_espera_ms = 10; // usado para calcular la velocidad (en ms)
+  const int tiempo_espera_ms = 9; // usado para calcular la velocidad (en ms)
 
   while (true) {
     Posicion pos;
