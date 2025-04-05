@@ -1,3 +1,4 @@
+#include "config.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -15,10 +16,10 @@ struct Posicion {
   int y;
 };
 
+enum class EstadoCliente { OCULTO = 0, VISIBLE = 1, FULLSCREEN = 2 };
+
 const char *his = getenv("HYPRLAND_INSTANCE_SIGNATURE");
 const char *xdg = getenv("XDG_RUNTIME_DIR");
-
-const int DOCK_HEIGHT = 100;
 
 bool enviar_comando_socket(const std::string &comando, std::string &respuesta) {
   if (!his || !xdg) {
@@ -131,7 +132,7 @@ std::string ejecutar_y_obtener_salida(const std::string &cmd) {
   return salida;
 }
 
-bool evaluarDock(int monitor_height, int dock_height) {
+EstadoCliente evaluarDock(int monitor_height, int dock_height) {
   try {
     // Obtener información de monitores
     std::string monitors_json =
@@ -140,7 +141,7 @@ bool evaluarDock(int monitor_height, int dock_height) {
 
     if (!monitors.is_array() || monitors.empty()) {
       std::cerr << "Formato de monitores inválido" << std::endl;
-      return false;
+      return EstadoCliente::OCULTO;
     }
 
     // Buscar el monitor enfocado
@@ -150,14 +151,14 @@ bool evaluarDock(int monitor_height, int dock_height) {
 
     if (focused_monitor == monitors.end()) {
       std::cerr << "No se encontró monitor enfocado" << std::endl;
-      return false;
+      return EstadoCliente::OCULTO;
     }
 
     int active_ws = focused_monitor->value("activeWorkspace",
                                            nlohmann::json({{"id", 0}}))["id"];
     int special_ws = focused_monitor->value("specialWorkspace",
                                             nlohmann::json({{"id", 0}}))["id"];
-    int ws_id = (special_ws == 0) ? active_ws : special_ws;
+    int ws_id = (special_ws == 0) ? active_ws : special_ws; // workspace activo
 
     // Obtener workspaces
     std::string workspaces_json =
@@ -166,7 +167,7 @@ bool evaluarDock(int monitor_height, int dock_height) {
 
     if (!workspaces.is_array()) {
       std::cerr << "Formato de workspaces inválido" << std::endl;
-      return false;
+      return EstadoCliente::OCULTO;
     }
 
     // Buscar el workspace actual
@@ -180,7 +181,7 @@ bool evaluarDock(int monitor_height, int dock_height) {
     }
 
     if (window_count == 0)
-      return true;
+      return EstadoCliente::VISIBLE;
 
     // Obtener clientes
     std::string clients_json = ejecutar_y_obtener_salida("hyprctl clients -j");
@@ -188,10 +189,10 @@ bool evaluarDock(int monitor_height, int dock_height) {
 
     if (!clients.is_array()) {
       std::cerr << "Formato de clientes inválido" << std::endl;
-      return false;
+      return EstadoCliente::OCULTO;
     }
 
-    bool shouldShow = true;
+    auto shouldShow = EstadoCliente::VISIBLE;
     for (const auto &client : clients) {
       if (client.value("workspace", nlohmann::json({{"id", -1}}))["id"] !=
           ws_id) {
@@ -201,15 +202,22 @@ bool evaluarDock(int monitor_height, int dock_height) {
       auto at = client.value("at", nlohmann::json::array({0, 0}));
       auto size = client.value("size", nlohmann::json::array({0, 0}));
 
-      if (at.size() < 2 || size.size() < 2)
-        continue;
+      // Evaluar si el cliente actual esta en pantalla completa no se va a
+      // mostrar el dock
+
+      if (client.value("fullscreen", -1) != 0) {
+        // std::cout << "Cliente en pantalla completa" << std::endl;
+        // std::cout << "Clientes: " << client.dump() << std::endl;
+        shouldShow = EstadoCliente::FULLSCREEN;
+        break;
+      }
 
       int posY = at[1].is_number() ? at[1].get<int>() : 0;
       int sizeY = size[1].is_number() ? size[1].get<int>() : 0;
 
       int free_space = monitor_height - posY - sizeY;
       if (free_space < dock_height) {
-        shouldShow = false;
+        shouldShow = EstadoCliente::OCULTO;
         break;
       }
     }
@@ -218,10 +226,10 @@ bool evaluarDock(int monitor_height, int dock_height) {
 
   } catch (const nlohmann::json::exception &e) {
     std::cerr << "Error de JSON: " << e.what() << std::endl;
-    return false;
+    return EstadoCliente::OCULTO;
   } catch (const std::exception &e) {
     std::cerr << "Error: " << e.what() << std::endl;
-    return false;
+    return EstadoCliente::OCULTO;
   }
 }
 
@@ -292,10 +300,7 @@ int main() {
   std::vector<Posicion> posiciones;
   posiciones.reserve(10);
   int veces = 0, cambios_seguidos = 0;
-  int time_to_wait = 0;        // contador para revertir el tamaño del cursor
-  const int sensibilidad = 10; // Entre más alto, menos sensible
-  const int sensibilidad_distancia = 250; // Entre más alto, menos sensible
-  const int tiempo = 80;
+  int time_to_wait = 0; // contador para revertir el tamaño del cursor
 
   while (true) {
     Posicion pos;
@@ -309,11 +314,11 @@ int main() {
     }
     if (posiciones.size() >= 10) {
       float velocidad_pen =
-          calcular_velocidad(posiciones[8], posiciones[7], sensibilidad);
+          calcular_velocidad(posiciones[8], posiciones[7], SENSIBILITY);
       float velocidad_ult =
-          calcular_velocidad(posiciones[9], posiciones[8], sensibilidad);
+          calcular_velocidad(posiciones[9], posiciones[8], SENSIBILITY);
       if (std::abs(velocidad_pen - velocidad_ult) > 4) {
-        std::cout << "Una vez" << std::endl;
+        // std::cout << "Una vez" << std::endl;
         veces += 100;
       } else {
         veces--; // Disminuir el contador pero no 0
@@ -321,7 +326,7 @@ int main() {
       if (veces >= 200) {
         veces = 0;
         cambios_seguidos++;
-        std::cout << "Una cambio seguido" << std::endl;
+        // std::cout << "Una cambio seguido" << std::endl;
       }
       if (cambios_seguidos >= 2) {
         cambios_seguidos = 0;
@@ -329,9 +334,9 @@ int main() {
             std::sqrt(std::pow(posiciones[0].x - posiciones[9].x, 2) +
                       std::pow(posiciones[0].y - posiciones[9].y, 2));
         std::cout << "Distancia recorrida: " << distancia << " px" << std::endl;
-        if (distancia < sensibilidad_distancia) {
+        if (distancia < DISTANCE_SENSIBILITY) {
           // std::cout << "Cambio de tamaño del cursor" << std::endl;
-          time_to_wait = tiempo; // Tiempo de espera para revertir
+          time_to_wait = TIME_TO_REVERT; // Tiempo de espera para revertir
           aumentar_tamano();
         }
       }
@@ -345,8 +350,11 @@ int main() {
     }
 
     bool cursorZona = (pos.y > min_y && pos.x >= min_w && pos.x <= max_w);
-    bool dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
-    bool shouldShowDock = cursorZona || dockWorkspace;
+    auto dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
+    bool shouldShowDock = cursorZona || dockWorkspace == EstadoCliente::VISIBLE;
+    if (dockWorkspace == EstadoCliente::FULLSCREEN) {
+      shouldShowDock = false;
+    }
     if (shouldShowDock && !dockVisible) {
       // std::cout << "Mostrando dock" << std::endl;
       mostrar_dock();
@@ -357,7 +365,7 @@ int main() {
       dockVisible = false;
     }
 
-    usleep(5000);
+    usleep(1000 * 20);
   }
 
   return 0;
