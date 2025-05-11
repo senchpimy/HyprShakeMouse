@@ -10,11 +10,15 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
+#include <chrono>
+using namespace std::chrono;
 
 struct Posicion {
   int x;
   int y;
 };
+
+auto start = high_resolution_clock::now();
 
 enum class EstadoCliente { OCULTO = 0, VISIBLE = 1, FULLSCREEN = 2 };
 
@@ -280,6 +284,7 @@ bool obtener_info_monitor(int &width, int &height) {
   return true;
 }
 
+
 int main() {
   if (!his || !xdg) {
     std::cerr << "Error: Variables de entorno no definidas." << std::endl;
@@ -290,64 +295,109 @@ int main() {
   if (!obtener_info_monitor(mon_width, mon_height)) {
     return 1;
   }
+
   int min_w = mon_width / 2 - 400;
   int max_w = mon_width / 2 + 400;
-  int min_y = mon_height * 90 / 100; // zona inferior del monitor
+  int min_y = mon_height * AREA_DE_MUESTRA / 100; // zona inferior del monitor
 
   lanzar_dock_inicial();
   bool dockVisible = true; // estado actual del dock
 
   std::vector<Posicion> posiciones;
-  posiciones.reserve(10);
+  posiciones.reserve(NUM_ELEMENTOS);
   int veces = 0, cambios_seguidos = 0;
-  int time_to_wait = 0; // contador para revertir el tamaño del cursor
 
   while (true) {
-    Posicion pos;
-    if (!obtener_posicion_cursor(pos)) {
-      // std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      continue;
-    }
-    posiciones.push_back(pos);
-    if (posiciones.size() > 10) {
-      posiciones.erase(posiciones.begin());
-    }
-    if (posiciones.size() >= 10) {
-      float velocidad_pen =
-          calcular_velocidad(posiciones[8], posiciones[7], SENSIBILITY);
-      float velocidad_ult =
-          calcular_velocidad(posiciones[9], posiciones[8], SENSIBILITY);
-      if (std::abs(velocidad_pen - velocidad_ult) > 4) {
-        // std::cout << "Una vez" << std::endl;
-        veces += 100;
-      } else {
-        veces--; // Disminuir el contador pero no 0
-      }
-      if (veces >= 200) {
-        veces = 0;
-        cambios_seguidos++;
-        // std::cout << "Una cambio seguido" << std::endl;
-      }
-      if (cambios_seguidos >= 2) {
-        cambios_seguidos = 0;
-        float distancia =
-            std::sqrt(std::pow(posiciones[0].x - posiciones[9].x, 2) +
-                      std::pow(posiciones[0].y - posiciones[9].y, 2));
-        std::cout << "Distancia recorrida: " << distancia << " px" << std::endl;
-        if (distancia < DISTANCE_SENSIBILITY) {
-          // std::cout << "Cambio de tamaño del cursor" << std::endl;
-          time_to_wait = TIME_TO_REVERT; // Tiempo de espera para revertir
-          aumentar_tamano();
+        Posicion pos;
+// Intentamos obtener la posición del cursor. Si falla, esperamos un poco
+        // y continuamos. Si tiene éxito, asumimos que ha pasado ~50ms desde la última vez.
+        // Es CRUCIAL que este bucle tenga una cadencia más o menos constante (aprox 50ms).
+        if (!obtener_posicion_cursor(pos)) {
+            // Si obtener_posicion_cursor() no bloquea por 50ms por sí mismo,
+            // descomenta la siguiente línea para asegurar el intervalo de tiempo.
+            // std::this_thread::sleep_for(std::chrono::milliseconds(50));
+             continue; // Saltar si no se pudo obtener posición
         }
-      }
-    }
-    if (time_to_wait > 0) {
-      time_to_wait--;
-      if (time_to_wait == 1) {
-        // std::cout << "Restaurando tamaño original del cursor" << std::endl;
-        disminuir_tamano();
-      }
-    }
+
+        // ---- Manejo del Historial ----
+        posiciones.push_back(pos);
+        if (posiciones.size() > NUM_ELEMENTOS) {
+            posiciones.erase(posiciones.begin()); // Eliminar la posición más antigua
+        }
+
+        // ---- Lógica de Enfriamiento ----
+        auto duration = high_resolution_clock::now() - start;
+        if (duration > milliseconds(TIME_TO_REVERT)) {
+            disminuir_tamano();
+            
+        }
+
+        // ---- Detección de Sacudida (Solo si hay suficientes puntos) ----
+        // Necesitamos al menos 3 puntos (P_i-2, P_i-1, P_i) para calcular 2 vectores (V_i-1, V_i)
+        if (posiciones.size() >= 3) {
+            double puntaje_sacudida_total = 0.0;
+
+            // Iterar sobre los puntos del historial que forman segmentos de 3 puntos.
+            // i es el índice del punto actual (P_i), i-1 es el punto anterior (P_i-1), i-2 es P_i-2
+            for (size_t i = 2; i < posiciones.size(); ++i) {
+                const Posicion& p_prev2 = posiciones[i - 2];
+                const Posicion& p_prev1 = posiciones[i - 1];
+                const Posicion& p_curr  = posiciones[i];
+
+                // Calcular vectores de movimiento (desplazamiento)
+                double v_prev_x = static_cast<double>(p_prev1.x - p_prev2.x);
+                double v_prev_y = static_cast<double>(p_prev1.y - p_prev2.y);
+
+                double v_curr_x = static_cast<double>(p_curr.x - p_prev1.x);
+                double v_curr_y = static_cast<double>(p_curr.y - p_prev1.y);
+
+                // Calcular magnitud cuadrada de los vectores (más rápido que sqrt)
+                double mag_prev_sq = v_prev_x * v_prev_x + v_prev_y * v_prev_y;
+                double mag_curr_sq = v_curr_x * v_curr_x + v_curr_y * v_curr_y;
+
+                // Check 1: Ambos movimientos deben ser lo suficientemente rápidos
+                if (mag_prev_sq > UMBRAL_VELOCIDAD_MIN_CUADRADO && mag_curr_sq > UMBRAL_VELOCIDAD_MIN_CUADRADO) {
+
+                    // Calcular producto punto
+                    double dot_prod = v_prev_x * v_curr_x + v_prev_y * v_curr_y;
+
+                    // Calcular magnitudes reales (necesarias para el coseno)
+                    double mag_prev = std::sqrt(mag_prev_sq);
+                    double mag_curr = std::sqrt(mag_curr_sq);
+
+                    // Check 2: Asegurar que las magnitudes no sean cero (o casi cero) antes de dividir
+                    if (mag_prev > 1e-6 && mag_curr > 1e-6) { // Usar una pequeña tolerancia
+                        // Calcular el coseno del ángulo entre los vectores
+                        double cos_theta = dot_prod / (mag_prev * mag_curr);
+
+                        // Check 3: La dirección debe haberse revertido significativamente
+                        if (cos_theta < UMBRAL_COSENO_REVERSION) {
+                            // Este segmento de movimiento cumple los criterios de "sacudida"
+                            // Sumar las magnitudes de los movimientos que cumplen
+                            puntaje_sacudida_total += (mag_prev + mag_curr) / 2.0;
+                            // O podrías usar otra fórmula de puntaje aquí
+                            // Por ejemplo: puntaje_sacudida_total += mag_prev * mag_curr * std::abs(cos_theta);
+                        }
+                    }
+                }
+            } // Fin del bucle for sobre el historial
+
+            // ---- Decisión final: ¿Hubo una sacudida? ----
+            if (puntaje_sacudida_total > UMBRAL_SACUDIDA_TOTAL) {
+                // std::cout << "============= SACUDIDA DETECTADA! =============" << std::endl;
+                // std::cout << "Puntaje Total: " << puntaje_sacudida_total << std::endl;
+
+                // Activar la acción (cambiar tamaño del cursor)
+                aumentar_tamano();
+                start = high_resolution_clock::now();
+
+                // Opcional: Limpiar el historial para evitar múltiples detecciones
+                // por el mismo shake prolongado
+                posiciones.clear();
+                // Si no limpias, el puntaje total se recalculará en el siguiente ciclo
+                // con una ventana deslizante, lo cual también es una estrategia válida.
+            }
+        } // Fin if(posiciones.size() >= 3)
 
     bool cursorZona = (pos.y > min_y && pos.x >= min_w && pos.x <= max_w);
     auto dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
@@ -365,7 +415,7 @@ int main() {
       dockVisible = false;
     }
 
-    usleep(1000 * 20);
+    usleep(1000 * FRECUENCIA_MS); //100ms
   }
 
   return 0;
