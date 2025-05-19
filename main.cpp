@@ -1,5 +1,5 @@
 #include "config.h"
-#include "tabletmode.h"
+#include "tabletmode.h" // Definición de TabletMode está abajo
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -13,6 +13,14 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <linux/input.h>
+
+namespace fs = std::filesystem;
 using namespace std::chrono;
 
 struct Posicion {
@@ -100,7 +108,7 @@ void cambiar_tamano_cursor(int tamaño) {
   std::string respuesta;
   if (!enviar_comando_socket(comando, respuesta)) {
     std::cerr << "Error al modificar el tamaño del cursor." << std::endl;
-    exit(1);
+    // exit(1);
   }
 }
 
@@ -120,7 +128,8 @@ void lanzar_dock_inicial() {
       " -r -i 64 -w 10 -mb 6 -hd 0 -c 'qs -p "
       "/home/plof/.config/quickshell/app_launcher/main.qml' -ico "
       "'/usr/share/icons/kora/actions/symbolic/view-app-grid-symbolic.svg'";
-  std::string cmd = "nwg-dock-hyprland" + flags;
+  std::string cmd = "nwg-dock-hyprland" + flags +
+                    " &"; // Añadido & para segundo plano si es dock
   ejecutar_comando(cmd);
   // std::this_thread::sleep_for(std::chrono::milliseconds(600));
 }
@@ -210,7 +219,7 @@ EstadoCliente evaluarDock(int monitor_height, int dock_height) {
 
       // Evaluar si el cliente actual esta en pantalla completa no se va a
       // mostrar el dock
-
+      // ESTA LÍNEA SE MANTIENE COMO EN TU CÓDIGO ORIGINAL:
       if (client.value("fullscreen", -1) != 0) {
         // std::cout << "Cliente en pantalla completa" << std::endl;
         // std::cout << "Clientes: " << client.dump() << std::endl;
@@ -227,7 +236,6 @@ EstadoCliente evaluarDock(int monitor_height, int dock_height) {
         break;
       }
     }
-
     return shouldShow;
 
   } catch (const nlohmann::json::exception &e) {
@@ -261,7 +269,7 @@ bool obtener_info_monitor(int &width, int &height) {
       return false;
     }
 
-    auto &primer_monitor = monitors[0];
+    auto &primer_monitor = monitors[0]; // Tu código original toma el primero
 
     if (!primer_monitor.contains("width") ||
         !primer_monitor["width"].is_number()) {
@@ -286,21 +294,11 @@ bool obtener_info_monitor(int &width, int &height) {
   return true;
 }
 
-#include <cstring>
-#include <errno.h>
-#include <fcntl.h>
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <linux/input.h>
-#include <string>
-#include <unistd.h>
-namespace fs = std::filesystem;
 class TabletMode {
 public:
   TabletMode();
   bool is_active();
-  bool isValid();
+  bool isValid() const { return fd >= 0; } // Añadido const
   ~TabletMode() {
     if (fd >= 0) {
       close(fd);
@@ -309,24 +307,59 @@ public:
 
 private:
   int fd = -1;
-  struct input_event ev;
+  // struct input_event ev; // No se usaba en tu is_active(), lo quito. Si lo
+  // necesitas, descomenta.
   std::string detect_device();
-  bool status = false;
+  bool status = false;       // Estado actual conocido
+  void manage_iio_process(); // NUEVA función miembro
 };
+
+// NUEVA función miembro para manejar iio-hyprland
+void TabletMode::manage_iio_process() {
+  if (this->status) { // Modo tablet está ENCENDIDO
+    std::cout << "Modo tablet activado. Iniciando iio-hyprland..." << std::endl;
+    ejecutar_comando("iio-hyprland &"); // Usar la función existente y añadir &
+  } else {                              // Modo tablet está APAGADO
+    std::cout << "Modo tablet desactivado. Terminando iio-hyprland..."
+              << std::endl;
+    ejecutar_comando("pkill -f iio-hyprland"); // Usar la función existente
+  }
+}
 
 TabletMode::TabletMode() {
   std::string device_path = detect_device();
   if (device_path.empty()) {
     std::cerr << "No se encontró un dispositivo con SW_TABLET_MODE.\n";
+    this->status = false; // Asegurar estado por defecto
+    manage_iio_process();
     return;
   }
 
-  fd = open(device_path.c_str(), O_RDONLY);
+  fd = open(device_path.c_str(),
+            O_RDONLY | O_NONBLOCK); // Añadido O_NONBLOCK por si acaso
   if (fd < 0) {
     std::cerr << "Error abriendo el dispositivo " << device_path << ": "
               << strerror(errno) << std::endl;
+    this->status = false; // Asegurar estado por defecto
+    manage_iio_process();
   } else {
     std::cout << "Dispositivo de modo tablet: " << device_path << std::endl;
+    unsigned char sw_state_initial[(SW_MAX + 7) / 8];
+    memset(sw_state_initial, 0, sizeof(sw_state_initial));
+
+    if (ioctl(this->fd, EVIOCGSW(sizeof(sw_state_initial)), sw_state_initial) >=
+        0) {
+      this->status =
+          (sw_state_initial[SW_TABLET_MODE / 8] >> (SW_TABLET_MODE % 8)) & 1;
+      std::cout << "Estado inicial de tablet mode: "
+                << (this->status ? "ACTIVADO" : "DESACTIVADO") << std::endl;
+    } else {
+      std::cerr << "Constructor TabletMode: Error con ioctl EVIOCGSW para "
+                   "estado inicial: "
+                << strerror(errno) << ". Asumiendo DESACTIVADO." << std::endl;
+      this->status = false; // Fallback seguro
+    }
+    manage_iio_process(); // Aplicar acción basada en el estado inicial
   }
 }
 
@@ -351,16 +384,25 @@ std::string TabletMode::detect_device() {
     std::getline(ev_file, ev_hex);
     std::getline(sw_file, sw_hex);
 
-    unsigned long ev_bits = std::stoul(ev_hex, nullptr, 16);
-    unsigned long sw_bits = std::stoul(sw_hex, nullptr, 16);
+    unsigned long ev_bits = 0;
+    unsigned long sw_bits = 0;
+    try {
+      ev_bits = std::stoul(ev_hex, nullptr, 16);
+      sw_bits = std::stoul(sw_hex, nullptr, 16);
+    } catch (const std::exception &e) {
+      // std::cerr << "Error convirtiendo hex para " << path.filename().string()
+      // << ": " << e.what() << std::endl;
+      continue; // Saltar este dispositivo si hay error de conversión
+    }
 
     constexpr unsigned long EV_SYN_BIT = 0; // EV_SYN is bit 0
     constexpr unsigned long EV_SW_BIT = 5;  // EV_SW is bit 5
     constexpr unsigned long SW_TABLET_MODE_BIT = 1;
 
-    bool has_ev_syn = ev_bits & (1 << EV_SYN_BIT);
-    bool has_ev_sw = ev_bits & (1 << EV_SW_BIT);
-    bool has_sw_tablet_mode = sw_bits & (1 << SW_TABLET_MODE_BIT);
+    bool has_ev_syn =
+        ev_bits & (1UL << EV_SYN_BIT); // Usar 1UL para asegurar tipo
+    bool has_ev_sw = ev_bits & (1UL << EV_SW_BIT);
+    bool has_sw_tablet_mode = sw_bits & (1UL << SW_TABLET_MODE_BIT);
 
     if (has_ev_syn && has_ev_sw && has_sw_tablet_mode) {
       auto str = "/dev/input/" + path.filename().string();
@@ -368,49 +410,35 @@ std::string TabletMode::detect_device() {
       return str;
     }
   }
-
   return "";
 }
 
-bool TabletMode::isValid() { return fd >= 0; }
-
-// --- Método usando ioctl (EVIOCGSW) ---
-// Obtiene el estado actual del switch SW_TABLET_MODE inmediatamente.
-bool TabletMode::is_active() { // Renombrado a is_active para simplicidad, como
-                               // en tu pregunta original
+// Tu método is_active modificado para llamar a manage_iio_process
+bool TabletMode::is_active() {
   if (!isValid()) {
-    std::cerr << "IOCTL: El descriptor de archivo del dispositivo no es válido."
-              << std::endl;
-    return false;
+    // std::cerr << "IOCTL: El descriptor de archivo del dispositivo no es
+    // válido." << std::endl; // Comentado como en tu original
+    return this->status; // Devolver el estado conocido si no es válido
   }
 
-  // Buffer para almacenar el estado de todos los switches.
-  // El tamaño es (SW_MAX / 8) + 1 bytes, ya que cada bit representa un switch.
-  // SW_MAX es el número máximo de códigos de switch definidos.
-  unsigned char sw_state[(SW_MAX + 7) / 8]; // +7 para redondear hacia arriba la
-                                            // división entera
-  memset(sw_state, 0, sizeof(sw_state));    // Inicializar el buffer a cero
+  unsigned char sw_state[(SW_MAX + 7) / 8];
+  memset(sw_state, 0, sizeof(sw_state));
 
-  // EVIOCGSW(len) es la macro para la petición ioctl.
-  // len es el tamaño del buffer (sw_state) que el kernel llenará.
   if (ioctl(fd, EVIOCGSW(sizeof(sw_state)), sw_state) < 0) {
-    std::cerr << "IOCTL: Error con ioctl EVIOCGSW: " << strerror(errno)
-              << std::endl;
-    return false; // O manejar el error de otra forma
+    // std::cerr << "IOCTL: Error con ioctl EVIOCGSW: " << strerror(errno) <<
+    // std::endl; // Comentado
+    return this->status; // En caso de error, devolver el estado conocido
   }
 
-  // Comprobar el bit específico para SW_TABLET_MODE.
-  // SW_TABLET_MODE / 8 nos da el índice del byte en el array sw_state.
-  // SW_TABLET_MODE % 8 nos da el índice del bit dentro de ese byte (0 a 7).
-  bool tablet_mode_is_set =
+  bool current_hw_tablet_mode =
       (sw_state[SW_TABLET_MODE / 8] >> (SW_TABLET_MODE % 8)) & 1;
-  if (tablet_mode_is_set != status) {
-    status = tablet_mode_is_set;
 
-    setTabletMode();
+  if (current_hw_tablet_mode != this->status) {
+    this->status = current_hw_tablet_mode;
+    setTabletMode();      // Esta función no estaba definida en el snippet
+    manage_iio_process(); // AHORA: Llamar a nuestra nueva función
   }
-
-  return tablet_mode_is_set;
+  return this->status; // Devolver el estado actualizado
 }
 
 int main() {
@@ -418,7 +446,8 @@ int main() {
     std::cerr << "Error: Variables de entorno no definidas." << std::endl;
     return 1;
   }
-  TabletMode tabletMode;
+  TabletMode tabletMode; // El constructor ahora maneja el estado inicial de
+                         // iio-hyprland
 
   int mon_width = 0, mon_height = 0;
   if (!obtener_info_monitor(mon_width, mon_height)) {
@@ -430,23 +459,30 @@ int main() {
   int min_y = mon_height * AREA_DE_MUESTRA / 100; // zona inferior del monitor
 
   lanzar_dock_inicial();
-  bool dockVisible = true; // estado actual del dock
+  bool dockVisible = true;
 
   std::vector<Posicion> posiciones;
   posiciones.reserve(NUM_ELEMENTOS);
-  int veces = 0, cambios_seguidos = 0;
 
   while (true) {
     if (tabletMode.is_active()) {
       std::cout << "Modo tablet activado desactivando funcionalidad"
                 << std::endl;
-      usleep(1000 * FRECUENCIA_MS); // 100ms
+      if (dockVisible) {
+        ocultar_dock();
+        dockVisible = false;
+      }
+      disminuir_tamano();
+
+      usleep(1000 * FRECUENCIA_MS); // Usar FRECUENCIA_MS, no la nueva constante
       continue;
     }
+
     Posicion pos;
 
     if (!obtener_posicion_cursor(pos)) {
-      continue; // Saltar si no se pudo obtener posición
+      usleep(1000 * FRECUENCIA_MS);
+      continue;
     }
 
     posiciones.push_back(pos);
@@ -459,14 +495,8 @@ int main() {
       disminuir_tamano();
     }
 
-    // Necesitamos al menos 3 puntos (P_i-2, P_i-1, P_i) para calcular 2
-    // vectores (V_i-1, V_i)
     if (posiciones.size() >= 3) {
       double puntaje_sacudida_total = 0.0;
-
-      // Iterar sobre los puntos del historial que forman segmentos de 3 puntos.
-      // i es el índice del punto actual (P_i), i-1 es el punto anterior
-      // (P_i-1), i-2 es P_i-2
       for (size_t i = 2; i < posiciones.size(); ++i) {
         const Posicion &p_prev2 = posiciones[i - 2];
         const Posicion &p_prev1 = posiciones[i - 1];
@@ -489,23 +519,14 @@ int main() {
           double mag_prev = std::sqrt(mag_prev_sq);
           double mag_curr = std::sqrt(mag_curr_sq);
 
-          if (mag_prev > 1e-6 &&
-              mag_curr > 1e-6) { // Usar una pequeña tolerancia
-            // Calcular el coseno del ángulo entre los vectores
+          if (mag_prev > 1e-6 && mag_curr > 1e-6) {
             double cos_theta = dot_prod / (mag_prev * mag_curr);
-
-            // Check 3: La dirección debe haberse revertido significativamente
             if (cos_theta < UMBRAL_COSENO_REVERSION) {
-              // Este segmento de movimiento cumple los criterios de "sacudida"
-              // Sumar las magnitudes de los movimientos que cumplen
               puntaje_sacudida_total += (mag_prev + mag_curr) / 2.0;
-              // O podrías usar otra fórmula de puntaje aquí
-              // Por ejemplo: puntaje_sacudida_total += mag_prev * mag_curr *
-              // std::abs(cos_theta);
             }
           }
         }
-      } // Fin del bucle for sobre el historial
+      }
 
       if (puntaje_sacudida_total > UMBRAL_SACUDIDA_TOTAL) {
         aumentar_tamano();
@@ -517,9 +538,11 @@ int main() {
     bool cursorZona = (pos.y > min_y && pos.x >= min_w && pos.x <= max_w);
     auto dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
     bool shouldShowDock = cursorZona || dockWorkspace == EstadoCliente::VISIBLE;
+
     if (dockWorkspace == EstadoCliente::FULLSCREEN) {
       shouldShowDock = false;
     }
+
     if (shouldShowDock && !dockVisible) {
       mostrar_dock();
       dockVisible = true;
@@ -528,7 +551,7 @@ int main() {
       dockVisible = false;
     }
 
-    usleep(1000 * FRECUENCIA_MS); // 100ms
+    usleep(1000 * FRECUENCIA_MS);
   }
 
   return 0;
