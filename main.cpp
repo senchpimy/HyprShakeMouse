@@ -1,4 +1,7 @@
 #include "config.h"
+#include "tabletmode.h"
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -10,7 +13,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include <vector>
-#include <chrono>
 using namespace std::chrono;
 
 struct Posicion {
@@ -284,12 +286,139 @@ bool obtener_info_monitor(int &width, int &height) {
   return true;
 }
 
+#include <cstring>
+#include <errno.h>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <linux/input.h>
+#include <string>
+#include <unistd.h>
+namespace fs = std::filesystem;
+class TabletMode {
+public:
+  TabletMode();
+  bool is_active();
+  bool isValid();
+  ~TabletMode() {
+    if (fd >= 0) {
+      close(fd);
+    }
+  }
+
+private:
+  int fd = -1;
+  struct input_event ev;
+  std::string detect_device();
+  bool status = false;
+};
+
+TabletMode::TabletMode() {
+  std::string device_path = detect_device();
+  if (device_path.empty()) {
+    std::cerr << "No se encontró un dispositivo con SW_TABLET_MODE.\n";
+    return;
+  }
+
+  fd = open(device_path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    std::cerr << "Error abriendo el dispositivo " << device_path << ": "
+              << strerror(errno) << std::endl;
+  } else {
+    std::cout << "Dispositivo de modo tablet: " << device_path << std::endl;
+  }
+}
+
+std::string TabletMode::detect_device() {
+  const std::string base = "/sys/class/input/";
+
+  for (const auto &entry : fs::directory_iterator(base)) {
+    if (!entry.is_directory())
+      continue;
+    const auto &path = entry.path();
+    if (path.filename().string().find("event") == std::string::npos)
+      continue;
+
+    // Verificar si soporta EV_SYN y EV_SW
+    std::ifstream ev_file(path / "device/capabilities/ev");
+    std::ifstream sw_file(path / "device/capabilities/sw");
+
+    if (!ev_file || !sw_file)
+      continue;
+
+    std::string ev_hex, sw_hex;
+    std::getline(ev_file, ev_hex);
+    std::getline(sw_file, sw_hex);
+
+    unsigned long ev_bits = std::stoul(ev_hex, nullptr, 16);
+    unsigned long sw_bits = std::stoul(sw_hex, nullptr, 16);
+
+    constexpr unsigned long EV_SYN_BIT = 0; // EV_SYN is bit 0
+    constexpr unsigned long EV_SW_BIT = 5;  // EV_SW is bit 5
+    constexpr unsigned long SW_TABLET_MODE_BIT = 1;
+
+    bool has_ev_syn = ev_bits & (1 << EV_SYN_BIT);
+    bool has_ev_sw = ev_bits & (1 << EV_SW_BIT);
+    bool has_sw_tablet_mode = sw_bits & (1 << SW_TABLET_MODE_BIT);
+
+    if (has_ev_syn && has_ev_sw && has_sw_tablet_mode) {
+      auto str = "/dev/input/" + path.filename().string();
+      std::cout << "Dispositivo encontrado: " << str << std::endl;
+      return str;
+    }
+  }
+
+  return "";
+}
+
+bool TabletMode::isValid() { return fd >= 0; }
+
+// --- Método usando ioctl (EVIOCGSW) ---
+// Obtiene el estado actual del switch SW_TABLET_MODE inmediatamente.
+bool TabletMode::is_active() { // Renombrado a is_active para simplicidad, como
+                               // en tu pregunta original
+  if (!isValid()) {
+    std::cerr << "IOCTL: El descriptor de archivo del dispositivo no es válido."
+              << std::endl;
+    return false;
+  }
+
+  // Buffer para almacenar el estado de todos los switches.
+  // El tamaño es (SW_MAX / 8) + 1 bytes, ya que cada bit representa un switch.
+  // SW_MAX es el número máximo de códigos de switch definidos.
+  unsigned char sw_state[(SW_MAX + 7) / 8]; // +7 para redondear hacia arriba la
+                                            // división entera
+  memset(sw_state, 0, sizeof(sw_state));    // Inicializar el buffer a cero
+
+  // EVIOCGSW(len) es la macro para la petición ioctl.
+  // len es el tamaño del buffer (sw_state) que el kernel llenará.
+  if (ioctl(fd, EVIOCGSW(sizeof(sw_state)), sw_state) < 0) {
+    std::cerr << "IOCTL: Error con ioctl EVIOCGSW: " << strerror(errno)
+              << std::endl;
+    return false; // O manejar el error de otra forma
+  }
+
+  // Comprobar el bit específico para SW_TABLET_MODE.
+  // SW_TABLET_MODE / 8 nos da el índice del byte en el array sw_state.
+  // SW_TABLET_MODE % 8 nos da el índice del bit dentro de ese byte (0 a 7).
+  bool tablet_mode_is_set =
+      (sw_state[SW_TABLET_MODE / 8] >> (SW_TABLET_MODE % 8)) & 1;
+  if (tablet_mode_is_set != status) {
+    status = tablet_mode_is_set;
+
+    setTabletMode();
+  }
+
+  return tablet_mode_is_set;
+}
 
 int main() {
   if (!his || !xdg) {
     std::cerr << "Error: Variables de entorno no definidas." << std::endl;
     return 1;
   }
+  TabletMode tabletMode;
 
   int mon_width = 0, mon_height = 0;
   if (!obtener_info_monitor(mon_width, mon_height)) {
@@ -308,96 +437,82 @@ int main() {
   int veces = 0, cambios_seguidos = 0;
 
   while (true) {
-        Posicion pos;
-// Intentamos obtener la posición del cursor. Si falla, esperamos un poco
-        // y continuamos. Si tiene éxito, asumimos que ha pasado ~50ms desde la última vez.
-        // Es CRUCIAL que este bucle tenga una cadencia más o menos constante (aprox 50ms).
-        if (!obtener_posicion_cursor(pos)) {
-            // Si obtener_posicion_cursor() no bloquea por 50ms por sí mismo,
-            // descomenta la siguiente línea para asegurar el intervalo de tiempo.
-            // std::this_thread::sleep_for(std::chrono::milliseconds(50));
-             continue; // Saltar si no se pudo obtener posición
-        }
+    if (tabletMode.is_active()) {
+      std::cout << "Modo tablet activado desactivando funcionalidad"
+                << std::endl;
+      usleep(1000 * FRECUENCIA_MS); // 100ms
+      continue;
+    }
+    Posicion pos;
 
-        // ---- Manejo del Historial ----
-        posiciones.push_back(pos);
-        if (posiciones.size() > NUM_ELEMENTOS) {
-            posiciones.erase(posiciones.begin()); // Eliminar la posición más antigua
-        }
+    if (!obtener_posicion_cursor(pos)) {
+      continue; // Saltar si no se pudo obtener posición
+    }
 
-        // ---- Lógica de Enfriamiento ----
-        auto duration = high_resolution_clock::now() - start;
-        if (duration > milliseconds(TIME_TO_REVERT)) {
-            disminuir_tamano();
-            
-        }
+    posiciones.push_back(pos);
+    if (posiciones.size() > NUM_ELEMENTOS) {
+      posiciones.erase(posiciones.begin()); // Eliminar la posición más antigua
+    }
 
-        // ---- Detección de Sacudida (Solo si hay suficientes puntos) ----
-        // Necesitamos al menos 3 puntos (P_i-2, P_i-1, P_i) para calcular 2 vectores (V_i-1, V_i)
-        if (posiciones.size() >= 3) {
-            double puntaje_sacudida_total = 0.0;
+    auto duration = high_resolution_clock::now() - start;
+    if (duration > milliseconds(TIME_TO_REVERT)) {
+      disminuir_tamano();
+    }
 
-            // Iterar sobre los puntos del historial que forman segmentos de 3 puntos.
-            // i es el índice del punto actual (P_i), i-1 es el punto anterior (P_i-1), i-2 es P_i-2
-            for (size_t i = 2; i < posiciones.size(); ++i) {
-                const Posicion& p_prev2 = posiciones[i - 2];
-                const Posicion& p_prev1 = posiciones[i - 1];
-                const Posicion& p_curr  = posiciones[i];
+    // Necesitamos al menos 3 puntos (P_i-2, P_i-1, P_i) para calcular 2
+    // vectores (V_i-1, V_i)
+    if (posiciones.size() >= 3) {
+      double puntaje_sacudida_total = 0.0;
 
-                // Calcular vectores de movimiento (desplazamiento)
-                double v_prev_x = static_cast<double>(p_prev1.x - p_prev2.x);
-                double v_prev_y = static_cast<double>(p_prev1.y - p_prev2.y);
+      // Iterar sobre los puntos del historial que forman segmentos de 3 puntos.
+      // i es el índice del punto actual (P_i), i-1 es el punto anterior
+      // (P_i-1), i-2 es P_i-2
+      for (size_t i = 2; i < posiciones.size(); ++i) {
+        const Posicion &p_prev2 = posiciones[i - 2];
+        const Posicion &p_prev1 = posiciones[i - 1];
+        const Posicion &p_curr = posiciones[i];
 
-                double v_curr_x = static_cast<double>(p_curr.x - p_prev1.x);
-                double v_curr_y = static_cast<double>(p_curr.y - p_prev1.y);
+        double v_prev_x = static_cast<double>(p_prev1.x - p_prev2.x);
+        double v_prev_y = static_cast<double>(p_prev1.y - p_prev2.y);
 
-                // Calcular magnitud cuadrada de los vectores (más rápido que sqrt)
-                double mag_prev_sq = v_prev_x * v_prev_x + v_prev_y * v_prev_y;
-                double mag_curr_sq = v_curr_x * v_curr_x + v_curr_y * v_curr_y;
+        double v_curr_x = static_cast<double>(p_curr.x - p_prev1.x);
+        double v_curr_y = static_cast<double>(p_curr.y - p_prev1.y);
 
-                // Check 1: Ambos movimientos deben ser lo suficientemente rápidos
-                if (mag_prev_sq > UMBRAL_VELOCIDAD_MIN_CUADRADO && mag_curr_sq > UMBRAL_VELOCIDAD_MIN_CUADRADO) {
+        double mag_prev_sq = v_prev_x * v_prev_x + v_prev_y * v_prev_y;
+        double mag_curr_sq = v_curr_x * v_curr_x + v_curr_y * v_curr_y;
 
-                    // Calcular producto punto
-                    double dot_prod = v_prev_x * v_curr_x + v_prev_y * v_curr_y;
+        if (mag_prev_sq > UMBRAL_VELOCIDAD_MIN_CUADRADO &&
+            mag_curr_sq > UMBRAL_VELOCIDAD_MIN_CUADRADO) {
 
-                    // Calcular magnitudes reales (necesarias para el coseno)
-                    double mag_prev = std::sqrt(mag_prev_sq);
-                    double mag_curr = std::sqrt(mag_curr_sq);
+          double dot_prod = v_prev_x * v_curr_x + v_prev_y * v_curr_y;
 
-                    // Check 2: Asegurar que las magnitudes no sean cero (o casi cero) antes de dividir
-                    if (mag_prev > 1e-6 && mag_curr > 1e-6) { // Usar una pequeña tolerancia
-                        // Calcular el coseno del ángulo entre los vectores
-                        double cos_theta = dot_prod / (mag_prev * mag_curr);
+          double mag_prev = std::sqrt(mag_prev_sq);
+          double mag_curr = std::sqrt(mag_curr_sq);
 
-                        // Check 3: La dirección debe haberse revertido significativamente
-                        if (cos_theta < UMBRAL_COSENO_REVERSION) {
-                            // Este segmento de movimiento cumple los criterios de "sacudida"
-                            // Sumar las magnitudes de los movimientos que cumplen
-                            puntaje_sacudida_total += (mag_prev + mag_curr) / 2.0;
-                            // O podrías usar otra fórmula de puntaje aquí
-                            // Por ejemplo: puntaje_sacudida_total += mag_prev * mag_curr * std::abs(cos_theta);
-                        }
-                    }
-                }
-            } // Fin del bucle for sobre el historial
+          if (mag_prev > 1e-6 &&
+              mag_curr > 1e-6) { // Usar una pequeña tolerancia
+            // Calcular el coseno del ángulo entre los vectores
+            double cos_theta = dot_prod / (mag_prev * mag_curr);
 
-            // ---- Decisión final: ¿Hubo una sacudida? ----
-            if (puntaje_sacudida_total > UMBRAL_SACUDIDA_TOTAL) {
-                // std::cout << "============= SACUDIDA DETECTADA! =============" << std::endl;
-                // std::cout << "Puntaje Total: " << puntaje_sacudida_total << std::endl;
-
-                // Activar la acción (cambiar tamaño del cursor)
-                aumentar_tamano();
-                start = high_resolution_clock::now();
-
-                // Opcional: Limpiar el historial para evitar múltiples detecciones
-                // por el mismo shake prolongado
-                posiciones.clear();
-                // Si no limpias, el puntaje total se recalculará en el siguiente ciclo
-                // con una ventana deslizante, lo cual también es una estrategia válida.
+            // Check 3: La dirección debe haberse revertido significativamente
+            if (cos_theta < UMBRAL_COSENO_REVERSION) {
+              // Este segmento de movimiento cumple los criterios de "sacudida"
+              // Sumar las magnitudes de los movimientos que cumplen
+              puntaje_sacudida_total += (mag_prev + mag_curr) / 2.0;
+              // O podrías usar otra fórmula de puntaje aquí
+              // Por ejemplo: puntaje_sacudida_total += mag_prev * mag_curr *
+              // std::abs(cos_theta);
             }
-        } // Fin if(posiciones.size() >= 3)
+          }
+        }
+      } // Fin del bucle for sobre el historial
+
+      if (puntaje_sacudida_total > UMBRAL_SACUDIDA_TOTAL) {
+        aumentar_tamano();
+        start = high_resolution_clock::now();
+        posiciones.clear();
+      }
+    }
 
     bool cursorZona = (pos.y > min_y && pos.x >= min_w && pos.x <= max_w);
     auto dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
@@ -406,16 +521,14 @@ int main() {
       shouldShowDock = false;
     }
     if (shouldShowDock && !dockVisible) {
-      // std::cout << "Mostrando dock" << std::endl;
       mostrar_dock();
       dockVisible = true;
     } else if (!shouldShowDock && dockVisible) {
-      // std::cout << "Ocultando dock" << std::endl;
       ocultar_dock();
       dockVisible = false;
     }
 
-    usleep(1000 * FRECUENCIA_MS); //100ms
+    usleep(1000 * FRECUENCIA_MS); // 100ms
   }
 
   return 0;
