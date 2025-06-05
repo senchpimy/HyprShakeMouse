@@ -112,9 +112,7 @@ void cambiar_tamano_cursor(int tamaño) {
   }
 }
 
-void aumentar_tamano() {
-  cambiar_tamano_cursor(50);
-} // 70 es mejor pero Hyprland se laggea
+void aumentar_tamano() { cambiar_tamano_cursor(50); }
 void disminuir_tamano() { cambiar_tamano_cursor(25); }
 
 void ejecutar_comando(const std::string &cmd) { system(cmd.c_str()); }
@@ -131,7 +129,6 @@ void lanzar_dock_inicial() {
   std::string cmd = "nwg-dock-hyprland" + flags +
                     " &"; // Añadido & para segundo plano si es dock
   ejecutar_comando(cmd);
-  // std::this_thread::sleep_for(std::chrono::milliseconds(600));
 }
 
 std::string ejecutar_y_obtener_salida(const std::string &cmd) {
@@ -298,7 +295,8 @@ class TabletMode {
 public:
   TabletMode();
   bool is_active();
-  bool isValid() const { return fd >= 0; } // Añadido const
+  bool conect(std::string);
+  bool isValid(); // const { return fd >= 0; }
   ~TabletMode() {
     if (fd >= 0) {
       close(fd);
@@ -307,12 +305,36 @@ public:
 
 private:
   int fd = -1;
-  // struct input_event ev; // No se usaba en tu is_active(), lo quito. Si lo
-  // necesitas, descomenta.
+  int retry = 5000;
   std::string detect_device();
   bool status = false;       // Estado actual conocido
   void manage_iio_process(); // NUEVA función miembro
 };
+
+bool TabletMode::isValid() {
+  auto valido = (fd >= 0);
+  if (valido) {
+    return true;
+  } else {
+    retry--;
+  }
+  if (retry <= 0) {
+    auto device_path = detect_device();
+    if (device_path.empty()) {
+      std::cerr << "Dispositivo no válido o no encontrado." << std::endl;
+      return false;
+    }
+    auto conectado = conect(device_path);
+    if (!conectado) {
+      std::cerr << "Error al conectar con el dispositivo: " << device_path
+                << std::endl;
+      retry = 5000; // Reiniciar el contador de reintentos
+      return false;
+    }
+    return true; // Aquí asumimos que si detect_device() no está vacío, es
+                 // válido
+  }
+}
 
 // NUEVA función miembro para manejar iio-hyprland
 void TabletMode::manage_iio_process() {
@@ -334,14 +356,20 @@ TabletMode::TabletMode() {
     manage_iio_process();
     return;
   }
+  conect(
+      device_path); // Llamar a la función conect con el dispositivo detectado
+                    //
+  manage_iio_process(); // Aplicar acción basada en el estado inicial
+}
 
+bool TabletMode::conect(std::string device_path) {
   fd = open(device_path.c_str(),
             O_RDONLY | O_NONBLOCK); // Añadido O_NONBLOCK por si acaso
   if (fd < 0) {
     std::cerr << "Error abriendo el dispositivo " << device_path << ": "
               << strerror(errno) << std::endl;
     this->status = false; // Asegurar estado por defecto
-    manage_iio_process();
+    return false;         // Fallo al abrir el dispositivo
   } else {
     std::cout << "Dispositivo de modo tablet: " << device_path << std::endl;
     unsigned char sw_state_initial[(SW_MAX + 7) / 8];
@@ -359,7 +387,7 @@ TabletMode::TabletMode() {
                 << strerror(errno) << ". Asumiendo DESACTIVADO." << std::endl;
       this->status = false; // Fallback seguro
     }
-    manage_iio_process(); // Aplicar acción basada en el estado inicial
+    return true; // Éxito al abrir el dispositivo
   }
 }
 
@@ -390,8 +418,6 @@ std::string TabletMode::detect_device() {
       ev_bits = std::stoul(ev_hex, nullptr, 16);
       sw_bits = std::stoul(sw_hex, nullptr, 16);
     } catch (const std::exception &e) {
-      // std::cerr << "Error convirtiendo hex para " << path.filename().string()
-      // << ": " << e.what() << std::endl;
       continue; // Saltar este dispositivo si hay error de conversión
     }
 
@@ -413,12 +439,9 @@ std::string TabletMode::detect_device() {
   return "";
 }
 
-// Tu método is_active modificado para llamar a manage_iio_process
 bool TabletMode::is_active() {
   if (!isValid()) {
-    // std::cerr << "IOCTL: El descriptor de archivo del dispositivo no es
-    // válido." << std::endl; // Comentado como en tu original
-    return this->status; // Devolver el estado conocido si no es válido
+    return this->status;
   }
 
   unsigned char sw_state[(SW_MAX + 7) / 8];
@@ -435,7 +458,8 @@ bool TabletMode::is_active() {
 
   if (current_hw_tablet_mode != this->status) {
     this->status = current_hw_tablet_mode;
-    setTabletMode();      // Esta función no estaba definida en el snippet
+    setTabletMode(
+        this->status);    // Esta función no estaba definida en el snippet
     manage_iio_process(); // AHORA: Llamar a nuestra nueva función
   }
   return this->status; // Devolver el estado actualizado
@@ -465,23 +489,39 @@ int main() {
   posiciones.reserve(NUM_ELEMENTOS);
 
   while (true) {
-    if (tabletMode.is_active()) {
-      std::cout << "Modo tablet activado desactivando funcionalidad"
-                << std::endl;
-      if (dockVisible) {
-        ocultar_dock();
-        dockVisible = false;
-      }
-      disminuir_tamano();
-
-      usleep(1000 * FRECUENCIA_MS); // Usar FRECUENCIA_MS, no la nueva constante
-      continue;
-    }
 
     Posicion pos;
 
     if (!obtener_posicion_cursor(pos)) {
       usleep(1000 * FRECUENCIA_MS);
+      continue;
+    }
+
+    bool cursorZona = (pos.y > min_y && pos.x >= min_w && pos.x <= max_w);
+    auto dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
+    bool shouldShowDock = cursorZona || dockWorkspace == EstadoCliente::VISIBLE;
+
+    if (dockWorkspace == EstadoCliente::FULLSCREEN) {
+      shouldShowDock = false;
+    }
+
+    if (shouldShowDock && !dockVisible) {
+      mostrar_dock();
+      dockVisible = true;
+    } else if (!shouldShowDock && dockVisible) {
+      ocultar_dock();
+      dockVisible = false;
+    }
+    if (tabletMode.is_active()) {
+      std::cout << "Modo tablet activado desactivando funcionalidad"
+                << std::endl;
+      // if (dockVisible) {
+      //   ocultar_dock();
+      //   dockVisible = false;
+      // }
+      disminuir_tamano();
+
+      usleep(1000 * FRECUENCIA_MS); // Usar FRECUENCIA_MS, no la nueva constante
       continue;
     }
 
@@ -533,22 +573,6 @@ int main() {
         start = high_resolution_clock::now();
         posiciones.clear();
       }
-    }
-
-    bool cursorZona = (pos.y > min_y && pos.x >= min_w && pos.x <= max_w);
-    auto dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
-    bool shouldShowDock = cursorZona || dockWorkspace == EstadoCliente::VISIBLE;
-
-    if (dockWorkspace == EstadoCliente::FULLSCREEN) {
-      shouldShowDock = false;
-    }
-
-    if (shouldShowDock && !dockVisible) {
-      mostrar_dock();
-      dockVisible = true;
-    } else if (!shouldShowDock && dockVisible) {
-      ocultar_dock();
-      dockVisible = false;
     }
 
     usleep(1000 * FRECUENCIA_MS);
