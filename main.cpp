@@ -1,8 +1,11 @@
 #include "config.h"
-#include "tabletmode.h" // Definición de TabletMode está abajo
-#include <algorithm>
+// #define DETECT_SHAKE
+#ifdef DETECT_SHAKE
+#include "shakedetector.h"
+#endif
+#include "tabletmode.h"
+
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,67 +24,6 @@
 #include <linux/input.h>
 
 namespace fs = std::filesystem;
-using namespace std::chrono;
-
-constexpr double SHAKE_THRESHOLD = 1.5;
-constexpr double SHAKE_MIN_DIAGONAL = 100.0;
-constexpr int SHAKE_TIMEOUT_MS = 800;
-constexpr int HISTORY_SIZE = (1000 / FRECUENCIA_MS); // 1 segundo de historial
-
-struct Vector2D {
-  double x = 0.0, y = 0.0;
-  double distance(const Vector2D &other) const {
-    return std::sqrt(std::pow(x - other.x, 2) + std::pow(y - other.y, 2));
-  }
-};
-
-class ShakeDetector {
-public:
-  ShakeDetector() {
-    samples.resize(HISTORY_SIZE);
-    samples_distance.resize(HISTORY_SIZE, 0.0);
-  }
-
-  bool update(const Vector2D &pos) {
-    int previous_index =
-        (samples_index == 0) ? HISTORY_SIZE - 1 : samples_index - 1;
-    samples[samples_index] = pos;
-    samples_distance[samples_index] =
-        samples[samples_index].distance(samples[previous_index]);
-    samples_index = (samples_index + 1) % HISTORY_SIZE;
-
-    double trail = 0.0;
-    for (double distance : samples_distance) {
-      trail += distance;
-    }
-
-    double left = 1e100, right = -1e100, top = 1e100, bottom = -1e100;
-    for (const auto &position : samples) {
-      left = std::min(left, position.x);
-      right = std::max(right, position.x);
-      top = std::min(top, position.y);
-      bottom = std::max(bottom, position.y);
-    }
-    double diagonal = Vector2D{left, top}.distance(Vector2D{right, bottom});
-
-    if (diagonal > SHAKE_MIN_DIAGONAL && (trail / diagonal) > SHAKE_THRESHOLD) {
-      is_shaking = true;
-      shake_end_time = steady_clock::now() + milliseconds(SHAKE_TIMEOUT_MS);
-    } else {
-      if (is_shaking && steady_clock::now() > shake_end_time) {
-        is_shaking = false;
-      }
-    }
-    return is_shaking;
-  }
-
-private:
-  std::vector<Vector2D> samples;
-  std::vector<double> samples_distance;
-  int samples_index = 0;
-  bool is_shaking = false;
-  steady_clock::time_point shake_end_time;
-};
 
 struct Posicion {
   int x;
@@ -489,14 +431,20 @@ int main() {
       continue;
     }
 
+#ifdef DETECT_SHAKE
     bool sacudida_activa = detector.update({(double)pos.x, (double)pos.y});
     if (sacudida_activa && !cursor_agrandado) {
+      std::cout << "Sacudida detectada, aumentando tamaño del cursor."
+                << std::endl;
       aumentar_tamano();
       cursor_agrandado = true;
     } else if (!sacudida_activa && cursor_agrandado) {
+      std::cout << "Sacudida no detectada, disminuyendo tamaño del cursor."
+                << std::endl;
       disminuir_tamano();
       cursor_agrandado = false;
     }
+#endif
 
     usleep(1000 * FRECUENCIA_MS);
   }
