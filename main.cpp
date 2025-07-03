@@ -1,5 +1,4 @@
 #include "config.h"
-// #define DETECT_SHAKE
 #ifdef DETECT_SHAKE
 #include "shakedetector.h"
 #endif
@@ -398,7 +397,9 @@ int main() {
   lanzar_dock_inicial();
   bool dockVisible = true;
 
+#ifdef DETECT_SHAKE
   ShakeDetector detector;
+#endif
   bool cursor_agrandado = false;
 
   while (true) {

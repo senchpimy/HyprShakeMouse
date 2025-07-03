@@ -15,3 +15,9 @@ Además, añade una función de cambio de tamaño del cursor inspirada en macOS 
 ![video](video.gif)
 
 Para la funcion de _shake to find_ recomiendo mejor usar el plugin *dynamic-cursors*, se activa en la configuracion
+
+Pero si se quiere activar esta funcion se tiene que compilar con:
+
+```bash
+make DETECT_SHAKE=1
+```
