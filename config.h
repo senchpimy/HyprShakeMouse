@@ -42,7 +42,7 @@
 #define NUM_ELEMENTOS 30 // Altura del dock en píxeles
 
 //El porcentaje inferior en el cual se mostrara el dock
-#define AREA_DE_MUESTRA 98
+#define AREA_DE_MUESTRA 95
 
 #define FRECUENCIA_MS 100
 

@@ -23,12 +23,70 @@
 namespace fs = std::filesystem;
 using namespace std::chrono;
 
+constexpr double SHAKE_THRESHOLD = 1.5;
+constexpr double SHAKE_MIN_DIAGONAL = 100.0;
+constexpr int SHAKE_TIMEOUT_MS = 800;
+constexpr int HISTORY_SIZE = (1000 / FRECUENCIA_MS); // 1 segundo de historial
+
+struct Vector2D {
+  double x = 0.0, y = 0.0;
+  double distance(const Vector2D &other) const {
+    return std::sqrt(std::pow(x - other.x, 2) + std::pow(y - other.y, 2));
+  }
+};
+
+class ShakeDetector {
+public:
+  ShakeDetector() {
+    samples.resize(HISTORY_SIZE);
+    samples_distance.resize(HISTORY_SIZE, 0.0);
+  }
+
+  bool update(const Vector2D &pos) {
+    int previous_index =
+        (samples_index == 0) ? HISTORY_SIZE - 1 : samples_index - 1;
+    samples[samples_index] = pos;
+    samples_distance[samples_index] =
+        samples[samples_index].distance(samples[previous_index]);
+    samples_index = (samples_index + 1) % HISTORY_SIZE;
+
+    double trail = 0.0;
+    for (double distance : samples_distance) {
+      trail += distance;
+    }
+
+    double left = 1e100, right = -1e100, top = 1e100, bottom = -1e100;
+    for (const auto &position : samples) {
+      left = std::min(left, position.x);
+      right = std::max(right, position.x);
+      top = std::min(top, position.y);
+      bottom = std::max(bottom, position.y);
+    }
+    double diagonal = Vector2D{left, top}.distance(Vector2D{right, bottom});
+
+    if (diagonal > SHAKE_MIN_DIAGONAL && (trail / diagonal) > SHAKE_THRESHOLD) {
+      is_shaking = true;
+      shake_end_time = steady_clock::now() + milliseconds(SHAKE_TIMEOUT_MS);
+    } else {
+      if (is_shaking && steady_clock::now() > shake_end_time) {
+        is_shaking = false;
+      }
+    }
+    return is_shaking;
+  }
+
+private:
+  std::vector<Vector2D> samples;
+  std::vector<double> samples_distance;
+  int samples_index = 0;
+  bool is_shaking = false;
+  steady_clock::time_point shake_end_time;
+};
+
 struct Posicion {
   int x;
   int y;
 };
-
-auto start = high_resolution_clock::now();
 
 enum class EstadoCliente { OCULTO = 0, VISIBLE = 1, FULLSCREEN = 2 };
 
@@ -66,9 +124,7 @@ bool enviar_comando_socket(const std::string &comando, std::string &respuesta) {
     return false;
   }
 
-  shutdown(sockfd, SHUT_WR); // No más datos para enviar
-
-  // Leer toda la respuesta
+  shutdown(sockfd, SHUT_WR);
   char buffer[256];
   respuesta.clear();
   ssize_t bytesLeidos;
@@ -85,10 +141,6 @@ bool enviar_comando_socket(const std::string &comando, std::string &respuesta) {
 
   close(sockfd);
   return true;
-}
-
-float calcular_velocidad(const Posicion &a, const Posicion &b, float tiempo) {
-  return std::sqrt(std::pow(b.x - a.x, 2) + std::pow(b.y - a.y, 2)) / tiempo;
 }
 
 bool obtener_posicion_cursor(Posicion &pos) {
@@ -108,7 +160,6 @@ void cambiar_tamano_cursor(int tamaño) {
   std::string respuesta;
   if (!enviar_comando_socket(comando, respuesta)) {
     std::cerr << "Error al modificar el tamaño del cursor." << std::endl;
-    // exit(1);
   }
 }
 
@@ -118,7 +169,6 @@ void disminuir_tamano() { cambiar_tamano_cursor(25); }
 void ejecutar_comando(const std::string &cmd) { system(cmd.c_str()); }
 
 void mostrar_dock() { ejecutar_comando("pkill -36 -f nwg-dock-hyprland"); }
-
 void ocultar_dock() { ejecutar_comando("pkill -37 -f nwg-dock-hyprland"); }
 
 void lanzar_dock_inicial() {
@@ -126,8 +176,7 @@ void lanzar_dock_inicial() {
       " -r -i 64 -w 10 -mb 6 -hd 0 -c 'qs -p "
       "/home/plof/.config/quickshell/app_launcher/main.qml' -ico "
       "'/usr/share/icons/kora/actions/symbolic/view-app-grid-symbolic.svg'";
-  std::string cmd = "nwg-dock-hyprland" + flags +
-                    " &"; // Añadido & para segundo plano si es dock
+  std::string cmd = "nwg-dock-hyprland" + flags + " &";
   ejecutar_comando(cmd);
 }
 
@@ -146,21 +195,17 @@ std::string ejecutar_y_obtener_salida(const std::string &cmd) {
 
 EstadoCliente evaluarDock(int monitor_height, int dock_height) {
   try {
-    // Obtener información de monitores
     std::string monitors_json =
         ejecutar_y_obtener_salida("hyprctl monitors -j");
     auto monitors = nlohmann::json::parse(monitors_json);
-
     if (!monitors.is_array() || monitors.empty()) {
       std::cerr << "Formato de monitores inválido" << std::endl;
       return EstadoCliente::OCULTO;
     }
 
-    // Buscar el monitor enfocado
     auto focused_monitor =
         std::find_if(monitors.begin(), monitors.end(),
                      [](const auto &m) { return m.value("focused", false); });
-
     if (focused_monitor == monitors.end()) {
       std::cerr << "No se encontró monitor enfocado" << std::endl;
       return EstadoCliente::OCULTO;
@@ -170,40 +215,30 @@ EstadoCliente evaluarDock(int monitor_height, int dock_height) {
                                            nlohmann::json({{"id", 0}}))["id"];
     int special_ws = focused_monitor->value("specialWorkspace",
                                             nlohmann::json({{"id", 0}}))["id"];
-    int ws_id = (special_ws == 0) ? active_ws : special_ws; // workspace activo
-
-    // Obtener workspaces
+    int ws_id = (special_ws == 0) ? active_ws : special_ws;
     std::string workspaces_json =
         ejecutar_y_obtener_salida("hyprctl workspaces -j");
     auto workspaces = nlohmann::json::parse(workspaces_json);
-
     if (!workspaces.is_array()) {
       std::cerr << "Formato de workspaces inválido" << std::endl;
       return EstadoCliente::OCULTO;
     }
 
-    // Buscar el workspace actual
     auto workspace = std::find_if(
         workspaces.begin(), workspaces.end(),
         [ws_id](const auto &ws) { return ws.value("id", -1) == ws_id; });
-
     int window_count = 0;
     if (workspace != workspaces.end()) {
       window_count = workspace->value("windows", 0);
     }
-
     if (window_count == 0)
       return EstadoCliente::VISIBLE;
-
-    // Obtener clientes
     std::string clients_json = ejecutar_y_obtener_salida("hyprctl clients -j");
     auto clients = nlohmann::json::parse(clients_json);
-
     if (!clients.is_array()) {
       std::cerr << "Formato de clientes inválido" << std::endl;
       return EstadoCliente::OCULTO;
     }
-
     auto shouldShow = EstadoCliente::VISIBLE;
     for (const auto &client : clients) {
       if (client.value("workspace", nlohmann::json({{"id", -1}}))["id"] !=
@@ -211,22 +246,15 @@ EstadoCliente evaluarDock(int monitor_height, int dock_height) {
         continue;
       }
 
-      auto at = client.value("at", nlohmann::json::array({0, 0}));
-      auto size = client.value("size", nlohmann::json::array({0, 0}));
-
-      // Evaluar si el cliente actual esta en pantalla completa no se va a
-      // mostrar el dock
-      // ESTA LÍNEA SE MANTIENE COMO EN TU CÓDIGO ORIGINAL:
       if (client.value("fullscreen", -1) != 0) {
-        // std::cout << "Cliente en pantalla completa" << std::endl;
-        // std::cout << "Clientes: " << client.dump() << std::endl;
         shouldShow = EstadoCliente::FULLSCREEN;
         break;
       }
 
+      auto at = client.value("at", nlohmann::json::array({0, 0}));
+      auto size = client.value("size", nlohmann::json::array({0, 0}));
       int posY = at[1].is_number() ? at[1].get<int>() : 0;
       int sizeY = size[1].is_number() ? size[1].get<int>() : 0;
-
       int free_space = monitor_height - posY - sizeY;
       if (free_space < dock_height) {
         shouldShow = EstadoCliente::OCULTO;
@@ -234,7 +262,6 @@ EstadoCliente evaluarDock(int monitor_height, int dock_height) {
       }
     }
     return shouldShow;
-
   } catch (const nlohmann::json::exception &e) {
     std::cerr << "Error de JSON: " << e.what() << std::endl;
     return EstadoCliente::OCULTO;
@@ -257,17 +284,14 @@ bool obtener_info_monitor(int &width, int &height) {
     result += buffer;
   }
   pclose(pipe);
-
   try {
     auto monitors = nlohmann::json::parse(result);
-
     if (!monitors.is_array() || monitors.empty()) {
       std::cerr << "Formato de monitores inválido" << std::endl;
       return false;
     }
 
-    auto &primer_monitor = monitors[0]; // Tu código original toma el primero
-
+    auto &primer_monitor = monitors[0];
     if (!primer_monitor.contains("width") ||
         !primer_monitor["width"].is_number()) {
       std::cerr << "No se pudo obtener el width del monitor" << std::endl;
@@ -282,7 +306,6 @@ bool obtener_info_monitor(int &width, int &height) {
 
     width = primer_monitor["width"];
     height = primer_monitor["height"];
-
   } catch (const nlohmann::json::exception &e) {
     std::cerr << "Error al parsear JSON: " << e.what() << std::endl;
     return false;
@@ -296,55 +319,42 @@ public:
   TabletMode();
   bool is_active();
   bool conect(std::string);
-  bool isValid(); // const { return fd >= 0; }
+  bool isValid();
   ~TabletMode() {
-    if (fd >= 0) {
+    if (fd >= 0)
       close(fd);
-    }
   }
 
 private:
   int fd = -1;
   int retry = 5000;
   std::string detect_device();
-  bool status = false;       // Estado actual conocido
-  void manage_iio_process(); // NUEVA función miembro
+  bool status = false;
+  void manage_iio_process();
+  void setTabletMode(bool) {} // Placeholder
 };
 
 bool TabletMode::isValid() {
-  auto valido = (fd >= 0);
-  if (valido) {
+  if (fd >= 0)
     return true;
-  } else {
-    retry--;
-  }
-  if (retry <= 0) {
-    auto device_path = detect_device();
-    if (device_path.empty()) {
-      std::cerr << "Dispositivo no válido o no encontrado." << std::endl;
-      return false;
-    }
-    auto conectado = conect(device_path);
-    if (!conectado) {
-      std::cerr << "Error al conectar con el dispositivo: " << device_path
-                << std::endl;
-      retry = 5000; // Reiniciar el contador de reintentos
-      return false;
-    }
-    return true; // Aquí asumimos que si detect_device() no está vacío, es
-                 // válido
-  }
+  retry--;
+  if (retry > 0)
+    return false;
+  retry = 5000;
+  auto device_path = detect_device();
+  if (device_path.empty() || !conect(device_path))
+    return false;
+  return true;
 }
 
-// NUEVA función miembro para manejar iio-hyprland
 void TabletMode::manage_iio_process() {
-  if (this->status) { // Modo tablet está ENCENDIDO
+  if (this->status) {
     std::cout << "Modo tablet activado. Iniciando iio-hyprland..." << std::endl;
-    ejecutar_comando("iio-hyprland &"); // Usar la función existente y añadir &
-  } else {                              // Modo tablet está APAGADO
+    ejecutar_comando("iio-hyprland &");
+  } else {
     std::cout << "Modo tablet desactivado. Terminando iio-hyprland..."
               << std::endl;
-    ejecutar_comando("pkill -f iio-hyprland"); // Usar la función existente
+    ejecutar_comando("pkill -f iio-hyprland");
   }
 }
 
@@ -352,86 +362,60 @@ TabletMode::TabletMode() {
   std::string device_path = detect_device();
   if (device_path.empty()) {
     std::cerr << "No se encontró un dispositivo con SW_TABLET_MODE.\n";
-    this->status = false; // Asegurar estado por defecto
-    manage_iio_process();
-    return;
+    this->status = false;
+  } else {
+    conect(device_path);
   }
-  conect(
-      device_path); // Llamar a la función conect con el dispositivo detectado
-                    //
-  manage_iio_process(); // Aplicar acción basada en el estado inicial
+  manage_iio_process();
 }
 
 bool TabletMode::conect(std::string device_path) {
-  fd = open(device_path.c_str(),
-            O_RDONLY | O_NONBLOCK); // Añadido O_NONBLOCK por si acaso
+  fd = open(device_path.c_str(), O_RDONLY | O_NONBLOCK);
   if (fd < 0) {
     std::cerr << "Error abriendo el dispositivo " << device_path << ": "
               << strerror(errno) << std::endl;
-    this->status = false; // Asegurar estado por defecto
-    return false;         // Fallo al abrir el dispositivo
-  } else {
-    std::cout << "Dispositivo de modo tablet: " << device_path << std::endl;
-    unsigned char sw_state_initial[(SW_MAX + 7) / 8];
-    memset(sw_state_initial, 0, sizeof(sw_state_initial));
-
-    if (ioctl(this->fd, EVIOCGSW(sizeof(sw_state_initial)), sw_state_initial) >=
-        0) {
-      this->status =
-          (sw_state_initial[SW_TABLET_MODE / 8] >> (SW_TABLET_MODE % 8)) & 1;
-      std::cout << "Estado inicial de tablet mode: "
-                << (this->status ? "ACTIVADO" : "DESACTIVADO") << std::endl;
-    } else {
-      std::cerr << "Constructor TabletMode: Error con ioctl EVIOCGSW para "
-                   "estado inicial: "
-                << strerror(errno) << ". Asumiendo DESACTIVADO." << std::endl;
-      this->status = false; // Fallback seguro
-    }
-    return true; // Éxito al abrir el dispositivo
+    this->status = false;
+    return false;
   }
+  std::cout << "Dispositivo de modo tablet: " << device_path << std::endl;
+  unsigned char sw_state_initial[(SW_MAX + 7) / 8];
+  memset(sw_state_initial, 0, sizeof(sw_state_initial));
+  if (ioctl(this->fd, EVIOCGSW(sizeof(sw_state_initial)), sw_state_initial) >=
+      0) {
+    this->status =
+        (sw_state_initial[SW_TABLET_MODE / 8] >> (SW_TABLET_MODE % 8)) & 1;
+    std::cout << "Estado inicial de tablet mode: "
+              << (this->status ? "ACTIVADO" : "DESACTIVADO") << std::endl;
+  } else {
+    std::cerr << "Constructor TabletMode: Error con ioctl EVIOCGSW: "
+              << strerror(errno) << ". Asumiendo DESACTIVADO." << std::endl;
+    this->status = false;
+  }
+  return true;
 }
 
 std::string TabletMode::detect_device() {
   const std::string base = "/sys/class/input/";
-
   for (const auto &entry : fs::directory_iterator(base)) {
-    if (!entry.is_directory())
+    if (!entry.is_directory() ||
+        entry.path().filename().string().find("event") == std::string::npos)
       continue;
-    const auto &path = entry.path();
-    if (path.filename().string().find("event") == std::string::npos)
-      continue;
-
-    // Verificar si soporta EV_SYN y EV_SW
-    std::ifstream ev_file(path / "device/capabilities/ev");
-    std::ifstream sw_file(path / "device/capabilities/sw");
-
+    std::ifstream ev_file(entry.path() / "device/capabilities/ev");
+    std::ifstream sw_file(entry.path() / "device/capabilities/sw");
     if (!ev_file || !sw_file)
       continue;
-
-    std::string ev_hex, sw_hex;
-    std::getline(ev_file, ev_hex);
-    std::getline(sw_file, sw_hex);
-
-    unsigned long ev_bits = 0;
-    unsigned long sw_bits = 0;
+    unsigned long ev_bits = 0, sw_bits = 0;
     try {
+      std::string ev_hex, sw_hex;
+      std::getline(ev_file, ev_hex);
+      std::getline(sw_file, sw_hex);
       ev_bits = std::stoul(ev_hex, nullptr, 16);
       sw_bits = std::stoul(sw_hex, nullptr, 16);
-    } catch (const std::exception &e) {
-      continue; // Saltar este dispositivo si hay error de conversión
+    } catch (const std::exception &) {
+      continue;
     }
-
-    constexpr unsigned long EV_SYN_BIT = 0; // EV_SYN is bit 0
-    constexpr unsigned long EV_SW_BIT = 5;  // EV_SW is bit 5
-    constexpr unsigned long SW_TABLET_MODE_BIT = 1;
-
-    bool has_ev_syn =
-        ev_bits & (1UL << EV_SYN_BIT); // Usar 1UL para asegurar tipo
-    bool has_ev_sw = ev_bits & (1UL << EV_SW_BIT);
-    bool has_sw_tablet_mode = sw_bits & (1UL << SW_TABLET_MODE_BIT);
-
-    if (has_ev_syn && has_ev_sw && has_sw_tablet_mode) {
-      auto str = "/dev/input/" + path.filename().string();
+    if ((ev_bits & (1UL << 5)) && (sw_bits & (1UL << 1))) {
+      auto str = "/dev/input/" + entry.path().filename().string();
       std::cout << "Dispositivo encontrado: " << str << std::endl;
       return str;
     }
@@ -440,29 +424,20 @@ std::string TabletMode::detect_device() {
 }
 
 bool TabletMode::is_active() {
-  if (!isValid()) {
+  if (!isValid())
     return this->status;
-  }
-
   unsigned char sw_state[(SW_MAX + 7) / 8];
   memset(sw_state, 0, sizeof(sw_state));
-
-  if (ioctl(fd, EVIOCGSW(sizeof(sw_state)), sw_state) < 0) {
-    // std::cerr << "IOCTL: Error con ioctl EVIOCGSW: " << strerror(errno) <<
-    // std::endl; // Comentado
-    return this->status; // En caso de error, devolver el estado conocido
-  }
-
+  if (ioctl(fd, EVIOCGSW(sizeof(sw_state)), sw_state) < 0)
+    return this->status;
   bool current_hw_tablet_mode =
       (sw_state[SW_TABLET_MODE / 8] >> (SW_TABLET_MODE % 8)) & 1;
-
   if (current_hw_tablet_mode != this->status) {
     this->status = current_hw_tablet_mode;
-    setTabletMode(
-        this->status);    // Esta función no estaba definida en el snippet
-    manage_iio_process(); // AHORA: Llamar a nuestra nueva función
+    setTabletMode(this->status);
+    manage_iio_process();
   }
-  return this->status; // Devolver el estado actualizado
+  return this->status;
 }
 
 int main() {
@@ -470,41 +445,32 @@ int main() {
     std::cerr << "Error: Variables de entorno no definidas." << std::endl;
     return 1;
   }
-  TabletMode tabletMode; // El constructor ahora maneja el estado inicial de
-                         // iio-hyprland
-
+  TabletMode tabletMode;
   int mon_width = 0, mon_height = 0;
   if (!obtener_info_monitor(mon_width, mon_height)) {
     return 1;
   }
-
   int min_w = mon_width / 2 - 400;
   int max_w = mon_width / 2 + 400;
-  int min_y = mon_height * AREA_DE_MUESTRA / 100; // zona inferior del monitor
-
+  int min_y = mon_height * AREA_DE_MUESTRA / 100;
   lanzar_dock_inicial();
   bool dockVisible = true;
 
-  std::vector<Posicion> posiciones;
-  posiciones.reserve(NUM_ELEMENTOS);
+  ShakeDetector detector;
+  bool cursor_agrandado = false;
 
   while (true) {
-
     Posicion pos;
-
     if (!obtener_posicion_cursor(pos)) {
       usleep(1000 * FRECUENCIA_MS);
       continue;
     }
-
     bool cursorZona = (pos.y > min_y && pos.x >= min_w && pos.x <= max_w);
     auto dockWorkspace = evaluarDock(mon_height, DOCK_HEIGHT);
     bool shouldShowDock = cursorZona || dockWorkspace == EstadoCliente::VISIBLE;
-
     if (dockWorkspace == EstadoCliente::FULLSCREEN) {
       shouldShowDock = false;
     }
-
     if (shouldShowDock && !dockVisible) {
       mostrar_dock();
       dockVisible = true;
@@ -515,68 +481,24 @@ int main() {
     if (tabletMode.is_active()) {
       std::cout << "Modo tablet activado desactivando funcionalidad"
                 << std::endl;
-      // if (dockVisible) {
-      //   ocultar_dock();
-      //   dockVisible = false;
-      // }
-      disminuir_tamano();
-
-      usleep(1000 * FRECUENCIA_MS); // Usar FRECUENCIA_MS, no la nueva constante
+      if (cursor_agrandado) {
+        disminuir_tamano();
+        cursor_agrandado = false;
+      }
+      usleep(1000 * FRECUENCIA_MS);
       continue;
     }
 
-    posiciones.push_back(pos);
-    if (posiciones.size() > NUM_ELEMENTOS) {
-      posiciones.erase(posiciones.begin()); // Eliminar la posición más antigua
-    }
-
-    auto duration = high_resolution_clock::now() - start;
-    if (duration > milliseconds(TIME_TO_REVERT)) {
+    bool sacudida_activa = detector.update({(double)pos.x, (double)pos.y});
+    if (sacudida_activa && !cursor_agrandado) {
+      aumentar_tamano();
+      cursor_agrandado = true;
+    } else if (!sacudida_activa && cursor_agrandado) {
       disminuir_tamano();
-    }
-
-    if (posiciones.size() >= 3) {
-      double puntaje_sacudida_total = 0.0;
-      for (size_t i = 2; i < posiciones.size(); ++i) {
-        const Posicion &p_prev2 = posiciones[i - 2];
-        const Posicion &p_prev1 = posiciones[i - 1];
-        const Posicion &p_curr = posiciones[i];
-
-        double v_prev_x = static_cast<double>(p_prev1.x - p_prev2.x);
-        double v_prev_y = static_cast<double>(p_prev1.y - p_prev2.y);
-
-        double v_curr_x = static_cast<double>(p_curr.x - p_prev1.x);
-        double v_curr_y = static_cast<double>(p_curr.y - p_prev1.y);
-
-        double mag_prev_sq = v_prev_x * v_prev_x + v_prev_y * v_prev_y;
-        double mag_curr_sq = v_curr_x * v_curr_x + v_curr_y * v_curr_y;
-
-        if (mag_prev_sq > UMBRAL_VELOCIDAD_MIN_CUADRADO &&
-            mag_curr_sq > UMBRAL_VELOCIDAD_MIN_CUADRADO) {
-
-          double dot_prod = v_prev_x * v_curr_x + v_prev_y * v_curr_y;
-
-          double mag_prev = std::sqrt(mag_prev_sq);
-          double mag_curr = std::sqrt(mag_curr_sq);
-
-          if (mag_prev > 1e-6 && mag_curr > 1e-6) {
-            double cos_theta = dot_prod / (mag_prev * mag_curr);
-            if (cos_theta < UMBRAL_COSENO_REVERSION) {
-              puntaje_sacudida_total += (mag_prev + mag_curr) / 2.0;
-            }
-          }
-        }
-      }
-
-      if (puntaje_sacudida_total > UMBRAL_SACUDIDA_TOTAL) {
-        aumentar_tamano();
-        start = high_resolution_clock::now();
-        posiciones.clear();
-      }
+      cursor_agrandado = false;
     }
 
     usleep(1000 * FRECUENCIA_MS);
   }
-
   return 0;
 }
